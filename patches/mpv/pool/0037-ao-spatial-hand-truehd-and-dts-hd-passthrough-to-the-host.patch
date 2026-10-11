@@ -17,7 +17,8 @@ begins a new timeline. An optional end_of_stream driver callback tells
 a push output that nothing more is written, so the host can flush what
 its encoder holds back. mpv's software volume cannot scale a bitstream,
 so the output hands its gain (volume, mute, volume-gain and replaygain)
-to the host to apply.
+to the host to apply, through an optional set_gain driver callback that
+ao_set_gain() calls whenever the gain changes, paused or not.
 
 The output refuses every other format and is not autoprobed: a host
 lists it first (--ao=spatial,) and everything else reaches the outputs
@@ -31,7 +32,7 @@ The output and header start from the ones Streamyfin's mpv build ships;
 the fallback latch and the volume callback (sink version 2) are new.
 
 diff --git a/audio/out/ao.c b/audio/out/ao.c
-index 4e5e9e3..3cacf38 100644
+index 4e5e9e3..ef2d124 100644
 --- a/audio/out/ao.c
 +++ b/audio/out/ao.c
 @@ -41,6 +41,7 @@ extern const struct ao_driver audio_out_audiounit;
@@ -52,9 +53,18 @@ index 4e5e9e3..3cacf38 100644
  #endif
      &audio_out_pcm,
      &audio_out_lavc,
+@@ -613,6 +617,8 @@ void ao_print_devices(struct mpv_global *global, struct mp_log *log,
+ void ao_set_gain(struct ao *ao, float gain)
+ {
+     atomic_store(&ao->gain, gain);
++    if (ao->driver->set_gain)
++        ao->driver->set_gain(ao, gain);
+ }
+ 
+ #define MUL_GAIN_i(d, num_samples, gain, low, center, high)                     \
 diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
 new file mode 100644
-index 0000000..c42dd22
+index 0000000..a862222
 --- /dev/null
 +++ b/audio/out/ao_spatial.m
 @@ -0,0 +1,309 @@
@@ -116,9 +126,6 @@ index 0000000..c42dd22
 +    // The host has finished this timeline; the next write begins another.
 +    bool ended;
 +    bool reload_requested;
-+    // mpv's software volume last handed to the host. It never reaches a
-+    // bitstream, so the host applies it.
-+    float gain;
 +};
 +
 +static _Atomic bool spatial_format_latch[2];
@@ -209,8 +216,7 @@ index 0000000..c42dd22
 +        return -1;
 +    }
 +
-+    p->gain = atomic_load(&ao->gain);
-+    p->sink->set_volume(p->sink->ctx, p->gain);
++    p->sink->set_volume(p->sink->ctx, atomic_load(&ao->gain));
 +
 +    // The host's encoder holds 1.5 s before its first output, so let mpv
 +    // queue well beyond that.
@@ -302,6 +308,15 @@ index 0000000..c42dd22
 +    p->sink->end(p->sink->ctx);
 +}
 +
++// mpv's software volume never reaches a bitstream, so the host applies it.
++// mpv calls this whenever it changes, paused or not.
++static void set_gain(struct ao *ao, float gain)
++{
++    struct priv *p = ao->priv;
++
++    p->sink->set_volume(p->sink->ctx, gain);
++}
++
 +static void get_state(struct ao *ao, struct mp_pcm_state *state)
 +{
 +    struct priv *p = ao->priv;
@@ -311,12 +326,6 @@ index 0000000..c42dd22
 +        p->reload_requested = true;
 +        atomic_store(&spatial_format_latch[spatial_latch_index(ao->format)], true);
 +        ao_request_reload(ao);
-+    }
-+
-+    float gain = atomic_load(&ao->gain);
-+    if (gain != p->gain) {
-+        p->gain = gain;
-+        p->sink->set_volume(p->sink->ctx, gain);
 +    }
 +
 +    if (p->playing && !p->paused && !p->clock_running &&
@@ -360,6 +369,7 @@ index 0000000..c42dd22
 +    .write       = audio_write,
 +    .get_state   = get_state,
 +    .end_of_stream = end_of_stream,
++    .set_gain    = set_gain,
 +    .priv_size   = sizeof(struct priv),
 +    .options     = (const struct m_option[]) {
 +        {"sink", OPT_INT64(sink_address)},
@@ -385,16 +395,20 @@ index 277b524..a7e38f9 100644
      return samples > 0 && (samples < space || ao->untimed);
  
 diff --git a/audio/out/internal.h b/audio/out/internal.h
-index 85fa777..fd91647 100644
+index 85fa777..7b64ea3 100644
 --- a/audio/out/internal.h
 +++ b/audio/out/internal.h
-@@ -173,6 +173,9 @@ struct ao_driver {
+@@ -173,6 +173,13 @@ struct ao_driver {
      bool (*write)(struct ao *ao, void **data, int samples);
      // push based: return mandatory stream information
      void (*get_state)(struct ao *ao, struct mp_pcm_state *state);
 +    // push based, optional: the audio has ended, and nothing more is written
 +    // until reset(). For drivers that hold audio back until they get more.
 +    void (*end_of_stream)(struct ao *ao);
++
++    // optional: mpv's software volume changed (ao_set_gain()). For drivers
++    // whose output it never reaches, such as a bitstream the host renders.
++    void (*set_gain)(struct ao *ao, float gain);
  
      // Return the list of devices currently available in the system. Use
      // ao_device_list_add() to add entries. The selected device will be set as
