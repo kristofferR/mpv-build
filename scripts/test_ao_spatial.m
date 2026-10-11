@@ -30,7 +30,8 @@ struct fake_sink {
     bool refuse, ready, failed;
     mpv_spatial_audio_codec codec;
     AVSampleBufferRenderSynchronizer *synchronizer;
-    int begins, closes, ends;
+    int begins, closes, ends, volumes;
+    float volume;
     int64_t begin_time;
     NSMutableData *received;
 };
@@ -56,6 +57,12 @@ static void sink_write(void *ctx, const void *data, size_t size)
 static bool sink_is_ready(void *ctx) { return ((struct fake_sink *)ctx)->ready; }
 static bool sink_has_failed(void *ctx) { return ((struct fake_sink *)ctx)->failed; }
 static void sink_close(void *ctx) { ((struct fake_sink *)ctx)->closes++; }
+static void sink_set_volume(void *ctx, float volume)
+{
+    struct fake_sink *s = ctx;
+    s->volumes++;
+    s->volume = volume;
+}
 // The real host flushes its renderer here, then reports ready.
 static void sink_end(void *ctx)
 {
@@ -76,7 +83,7 @@ static struct fake_sink *new_sink(void)
         .version = MPV_SPATIAL_AUDIO_SINK_VERSION, .ctx = s,
         .open = sink_open, .begin = sink_begin, .write = sink_write,
         .is_ready = sink_is_ready, .has_failed = sink_has_failed, .close = sink_close,
-        .end = sink_end,
+        .end = sink_end, .set_volume = sink_set_volume,
     };
     s->received = [[NSMutableData alloc] init];
     return s;
@@ -92,6 +99,7 @@ static struct ao *new_ao(struct fake_sink *s, int format)
     ao->format = format;
     ao->samplerate = 192000;
     ao->sstride = 16;
+    atomic_store(&ao->gain, 1.0f);
     return ao;
 }
 
@@ -137,11 +145,25 @@ int main(void)
         struct ao *ao = new_ao(s, AF_FORMAT_S_TRUEHD);
         struct priv *p = ao->priv;
         s->begins = 0;
+        s->volumes = 0;
         CHECK(init(ao) == 0, "init for TrueHD succeeds");
         CHECK(s->synchronizer == p->synchronizer && s->synchronizer != nil, "open gets the synchronizer");
         CHECK(s->begins == 1, "init begins a timeline");
         CHECK(ao->device_buffer == 192000 * 3, "mpv may queue 3 s");
         CHECK(p->synchronizer.rate == 0, "the clock waits at rate 0");
+        CHECK(s->volumes == 1 && s->volume == 1.0f, "open hands the host mpv's volume");
+
+        // mpv's software volume never reaches the bitstream, so changes go to
+        // the host, once each.
+        atomic_store(&ao->gain, 0.125f);
+        state_of(ao);
+        state_of(ao);
+        CHECK(s->volumes == 2 && s->volume == 0.125f, "a volume change reaches the host once (%d)", s->volumes);
+        atomic_store(&ao->gain, 0.0f);
+        state_of(ao);
+        CHECK(s->volume == 0.0f, "mute reaches the host as 0");
+        atomic_store(&ao->gain, 1.0f);
+        state_of(ao);
 
         // Bursts reach the host unchanged, before and after start().
         write_burst(ao, 0x5a);

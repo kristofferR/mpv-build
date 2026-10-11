@@ -15,7 +15,9 @@ keeps mpv's clock on. The clock waits until the host has queued enough
 audio, then runs from the timeline's start. A reset or an underrun
 begins a new timeline. An optional end_of_stream driver callback tells
 a push output that nothing more is written, so the host can flush what
-its encoder holds back.
+its encoder holds back. mpv's software volume cannot scale a bitstream,
+so the output hands its gain (volume, mute, volume-gain and replaygain)
+to the host to apply.
 
 The output refuses every other format and is not autoprobed: a host
 lists it first (--ao=spatial,) and everything else reaches the outputs
@@ -25,8 +27,8 @@ refuses it, and mpv falls back to decoding the track, the way
 avfoundation's compressed sink falls back. A later PCM initialization
 clears the latch.
 
-The output and header are the ones Streamyfin's mpv build ships, so one
-host sink works with both; only the fallback latch is new here.
+The output and header start from the ones Streamyfin's mpv build ships;
+the fallback latch and the volume callback (sink version 2) are new.
 
 diff --git a/audio/out/ao.c b/audio/out/ao.c
 index 4e5e9e3..3cacf38 100644
@@ -52,10 +54,10 @@ index 4e5e9e3..3cacf38 100644
      &audio_out_lavc,
 diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
 new file mode 100644
-index 0000000..002b296
+index 0000000..c42dd22
 --- /dev/null
 +++ b/audio/out/ao_spatial.m
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,309 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -114,6 +116,9 @@ index 0000000..002b296
 +    // The host has finished this timeline; the next write begins another.
 +    bool ended;
 +    bool reload_requested;
++    // mpv's software volume last handed to the host. It never reaches a
++    // bitstream, so the host applies it.
++    float gain;
 +};
 +
 +static _Atomic bool spatial_format_latch[2];
@@ -203,6 +208,9 @@ index 0000000..002b296
 +        p->synchronizer = nil;
 +        return -1;
 +    }
++
++    p->gain = atomic_load(&ao->gain);
++    p->sink->set_volume(p->sink->ctx, p->gain);
 +
 +    // The host's encoder holds 1.5 s before its first output, so let mpv
 +    // queue well beyond that.
@@ -305,6 +313,12 @@ index 0000000..002b296
 +        ao_request_reload(ao);
 +    }
 +
++    float gain = atomic_load(&ao->gain);
++    if (gain != p->gain) {
++        p->gain = gain;
++        p->sink->set_volume(p->sink->ctx, gain);
++    }
++
 +    if (p->playing && !p->paused && !p->clock_running &&
 +        p->sink->is_ready(p->sink->ctx))
 +    {
@@ -386,10 +400,10 @@ index 85fa777..fd91647 100644
      // ao_device_list_add() to add entries. The selected device will be set as
 diff --git a/include/mpv/spatial_audio.h b/include/mpv/spatial_audio.h
 new file mode 100644
-index 0000000..30a037a
+index 0000000..cd870f2
 --- /dev/null
 +++ b/include/mpv/spatial_audio.h
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,101 @@
 +/* Copyright (C) 2026 the mpv developers
 + *
 + * Permission to use, copy, modify, and/or distribute this software for any
@@ -432,7 +446,7 @@ index 0000000..30a037a
 + * true, then runs it from the timeline's start, so video waits for the host.
 + */
 +
-+#define MPV_SPATIAL_AUDIO_SINK_VERSION 1
++#define MPV_SPATIAL_AUDIO_SINK_VERSION 2
 +
 +typedef enum mpv_spatial_audio_codec {
 +    MPV_SPATIAL_AUDIO_CODEC_TRUEHD = 1,
@@ -476,6 +490,14 @@ index 0000000..30a037a
 +     * written, including what a startup buffer holds back, and become ready.
 +     */
 +    void (*end)(void *ctx);
++    /**
++     * mpv's software volume as a linear gain: --volume, --volume-gain,
++     * replaygain and --mute together, 0 when muted. mpv cannot scale a
++     * bitstream, so the host applies it to what it renders. Called after
++     * open() and whenever it changes; above 1 is amplification the host may
++     * clamp.
++     */
++    void (*set_volume)(void *ctx, float volume);
 +} mpv_spatial_audio_sink;
 +
 +#ifdef __cplusplus
