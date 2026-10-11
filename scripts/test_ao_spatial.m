@@ -122,6 +122,12 @@ static void write_burst(struct ao *ao, uint8_t fill)
 int main(void)
 {
     @autoreleasepool {
+        // ao_alloc() sets the gain before init(); nothing is open to tell.
+        struct fake_sink *early = new_sink();
+        struct ao *unopened = new_ao(early, AF_FORMAT_S_TRUEHD);
+        audio_out_spatial.set_gain(unopened, 1.0f);
+        CHECK(early->volumes == 0, "a gain set before init() reaches no host");
+
         // Without a sink, or for PCM, the output refuses, so mpv uses the next one.
         struct ao *none = new_ao(NULL, AF_FORMAT_S_TRUEHD);
         CHECK(init(none) < 0, "init without a sink must fail");

@@ -64,10 +64,10 @@ index 4e5e9e3..ef2d124 100644
  #define MUL_GAIN_i(d, num_samples, gain, low, center, high)                     \
 diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
 new file mode 100644
-index 0000000..a862222
+index 0000000..18d3080
 --- /dev/null
 +++ b/audio/out/ao_spatial.m
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,312 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -314,6 +314,9 @@ index 0000000..a862222
 +{
 +    struct priv *p = ao->priv;
 +
++    // ao_alloc() sets the gain before init() has opened the host.
++    if (!p->queue)
++        return;
 +    p->sink->set_volume(p->sink->ctx, gain);
 +}
 +
