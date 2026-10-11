@@ -99,7 +99,9 @@ static struct ao *new_ao(struct fake_sink *s, int format)
     ao->format = format;
     ao->samplerate = 192000;
     ao->sstride = 16;
+    // As ao_alloc() does, before any init().
     atomic_store(&ao->gain, 1.0f);
+    audio_out_spatial.set_gain(ao, 1.0f);
     return ao;
 }
 
