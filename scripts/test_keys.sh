@@ -58,7 +58,7 @@ def run(repo, *args, expect=0, env=None):
 LIBRARIES = {"libass": ["libass"], "FFmpeg": ["libavcodec", "libavutil"], "libmpv": ["libmpv"]}
 COMPONENTS = {"libass": "libass", "FFmpeg": "ffmpeg", "libmpv": "mpv"}
 PLATFORMS = ("ios", "isimulator", "maccatalyst", "macos", "tvos", "tvsimulator")
-ASSET_BASE = "https://github.com/edde746/mpv-build/releases/download/binaries-apple"
+ASSET_BASE = "https://github.com/kristofferR/mpv-build/releases/download/binaries-apple"
 
 VERSIONS = {
     "formatVersion": 1,
