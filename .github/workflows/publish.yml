@@ -18,10 +18,11 @@ name: Publish binaries
 # itself is per platform, so a new group is a group.json, its build job, and a
 # row in the record matrix below.
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
+
+# This validation branch only publishes Apple's artifacts to Kris's fork.
+env:
+  GH_REPO: kristofferR/mpv-build
 
 # Two pushes must never interleave asset uploads or commits to main, and a
 # cancelled run could leave the manifest committed without its assets.
@@ -37,7 +38,7 @@ jobs:
     name: Patch regression tests
     # The marker sits on this workflow's own commit, so the run it triggers
     # stops here instead of looping.
-    if: ${{ !contains(github.event.head_commit.message, '[skip binaries]') }}
+    if: github.repository == 'kristofferR/mpv-build' && github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
     # The harnesses need only bash, python3 and cc (plus libass's host
@@ -176,7 +177,7 @@ jobs:
         run: |
           # The group list and the per-group platform variants are discovered,
           # not restated here: keys.py reads them out of platforms/*/group.json.
-          groups="$(python3 scripts/keys.py groups)"
+          groups="apple"
           echo "groups=${groups}" >> "$GITHUB_STEP_SUMMARY"
 
           stale_groups=""
