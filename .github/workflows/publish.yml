@@ -590,12 +590,15 @@ jobs:
       # every stale group got here.
       - name: Skip groups with nothing stale
         id: stale
+        env:
+          STALE_GROUPS: ${{ needs.plan.outputs.stale_groups }}
+          PLATFORM_GROUP: ${{ matrix.group }}
         run: |
-          if [[ "${{ needs.plan.outputs.stale_groups }}" == *",${{ matrix.group }},"* ]]; then
+          if [[ "$STALE_GROUPS" == *",$PLATFORM_GROUP,"* ]]; then
             echo "stale=true" >> "$GITHUB_OUTPUT"
           else
             echo "stale=false" >> "$GITHUB_OUTPUT"
-            echo "${{ matrix.group }}: nothing stale, keeping the committed section"
+            echo "$PLATFORM_GROUP: nothing stale, keeping the committed section"
           fi
 
       # actions/download-artifact has no fail-on-empty input: a pattern that
