@@ -204,6 +204,7 @@ GROUPS = {
             Path("Sources/BuildScripts/Package.swift"),
             Path("Sources/BuildScripts/XCFrameworkBuild/base.swift"),
             Path("Sources/BuildScripts/XCFrameworkBuild/main.swift"),
+            Path("scripts/build_spatial.py"),
         ),
         package=Path("Package.swift"),
     ),
@@ -441,6 +442,10 @@ def key_inputs(root: Path, group: Group, artifact: str) -> str:
         f"component={component}",
     ]
     text.extend(_pin_lines(pins))
+    if group.name == "apple" and artifact == "libmpv":
+        # The Swift renderer and Rust core are folded into libmpv.a.
+        text.append("component=spatialaudiobridge")
+        text.extend(_pin_lines(resolved_pins(load_versions(root), "spatialaudiobridge", group.name)))
     text += [
         # Every build is GPL: the apple driver hardcodes --enable-gpl/-Dgpl=true
         # and the group.json builds have no flag matrix, so these two lines are
