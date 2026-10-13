@@ -1,7 +1,7 @@
 name: Publish binaries
 
-# Every push to main publishes the binaries that commit needs, so any commit on
-# main is pinnable. Asset names are content-addressed (they carry a key derived
+# This fork validation branch publishes Apple's binaries only on dispatch.
+# Asset names are content-addressed (they carry a key derived
 # from the sources that produced them), which makes them immutable: an asset
 # that already exists on a rolling prerelease is byte-identical to the one this
 # run would upload, so it is skipped instead of clobbered.
@@ -24,12 +24,16 @@ on:
         description: Compile only the private Swift bridge with Xcode 26.6
         type: boolean
         default: false
+      publish:
+        description: Publish validated binaries and commit their manifest (requires coordinator approval)
+        type: boolean
+        default: false
 
 # This validation branch only publishes Apple's artifacts to Kris's fork.
 env:
   GH_REPO: kristofferR/mpv-build
 
-# Two pushes must never interleave asset uploads or commits to main, and a
+# Two runs must never interleave asset uploads or commits to their branch, and a
 # cancelled run could leave the manifest committed without its assets.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -39,9 +43,18 @@ permissions:
   contents: read
 
 jobs:
+  workflow-check:
+    name: Validate fork workflow
+    if: github.repository == 'kristofferR/mpv-build' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint the dispatch workflow
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/publish.yml
+
   bridge-check:
     name: Check spatial bridge on Xcode 26.6
-    if: github.repository == 'kristofferR/mpv-build' && github.event_name == 'workflow_dispatch' && inputs.bridge_only
+    needs: workflow-check
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
@@ -76,8 +89,7 @@ jobs:
 
   tests:
     name: Patch regression tests
-    # The marker sits on this workflow's own commit, so the run it triggers
-    # stops here instead of looping.
+    needs: bridge-check
     if: github.repository == 'kristofferR/mpv-build' && github.event_name == 'workflow_dispatch' && !inputs.bridge_only
     permissions:
       contents: read
@@ -90,6 +102,12 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select and report Xcode 26.6
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+          xcrun swiftc -version
 
       - name: Test AO PCM lookahead
         run: ./scripts/test_ao_pcm_lookahead.sh
@@ -225,8 +243,7 @@ jobs:
         # crash in keys.py is not swallowed by the pipe into paste.
         shell: bash
         run: |
-          # The group list and the per-group platform variants are discovered,
-          # not restated here: keys.py reads them out of platforms/*/group.json.
+          # Only Apple binaries are authorized for this fork validation.
           groups="apple"
           echo "groups=${groups}" >> "$GITHUB_STEP_SUMMARY"
 
@@ -288,10 +305,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Select and report Xcode 26.6
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+          xcrun swiftc -version
+
       - name: Install dependencies
         run: |
-          brew install autoconf automake libtool ninja
-          python -m pip install meson==1.4.2
+          brew install autoconf automake libtool ninja uv
+          uv tool install meson==1.4.2
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # Only the stale libraries are compiled; the rest are restored from their
       # published per-platform zips. No version= argument: the URLs the build
@@ -310,6 +334,12 @@ jobs:
       - name: Build GPL version (${{ matrix.name }})
         run: |
           make build use-prebuilt libs=${{ needs.plan.outputs.stale_apple }} platform=${{ matrix.platforms }}
+
+      - name: Check spatial slices and combined archive links (${{ matrix.platform_type }})
+        shell: bash
+        run: |
+          mpv_version="$(uv run --no-project python -c 'import json; print(json.load(open("versions.json"))["components"]["mpv"]["version"])')"
+          bash scripts/test_spatial_archives.sh "dist/libmpv-$mpv_version" "${{ matrix.platform_type }}"
 
       - name: Name per-platform binaries by content (${{ matrix.platform_type }})
         run: |
@@ -334,7 +364,7 @@ jobs:
           if-no-files-found: error
 
   publish-apple:
-    name: Publish apple
+    name: Package apple
     needs: build-apple
     permissions:
       contents: write
@@ -364,6 +394,7 @@ jobs:
         run: python3 scripts/keys.py verify --platform-group apple
 
       - name: Upload binaries that are not published yet
+        if: inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/keys.py publish-assets --platform-group apple
@@ -608,7 +639,7 @@ jobs:
     # skipped need would otherwise skip this job -- silently publishing nothing
     # and leaving the commit unpinnable. The per-row gate below decides which
     # rows actually act; `!cancelled()` keeps a superseded run from publishing.
-    if: always() && !cancelled() && needs.plan.outputs.stale_groups != ''
+    if: always() && !cancelled() && inputs.publish && needs.plan.outputs.stale_groups != ''
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -689,7 +720,7 @@ jobs:
         run: python3 scripts/keys.py verify --platform-group ${{ matrix.group }}
 
       - name: Upload binaries that are not published yet
-        if: steps.stale.outputs.stale == 'true'
+        if: inputs.publish && steps.stale.outputs.stale == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/keys.py publish-assets --platform-group ${{ matrix.group }}
@@ -713,7 +744,7 @@ jobs:
     needs: [plan, publish-apple, publish]
     # always(): this gate is what proves a group that was stale actually
     # published, so it must run even when one of them failed.
-    if: always() && !cancelled() && needs.plan.outputs.stale_groups != ''
+    if: always() && !cancelled() && inputs.publish && needs.plan.outputs.stale_groups != ''
     permissions:
       contents: write
     runs-on: ubuntu-latest
