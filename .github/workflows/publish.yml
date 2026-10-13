@@ -19,6 +19,11 @@ name: Publish binaries
 # row in the record matrix below.
 on:
   workflow_dispatch:
+    inputs:
+      bridge_only:
+        description: Compile only the private Swift bridge with Xcode 26.6
+        type: boolean
+        default: false
 
 # This validation branch only publishes Apple's artifacts to Kris's fork.
 env:
@@ -34,11 +39,46 @@ permissions:
   contents: read
 
 jobs:
+  bridge-check:
+    name: Check spatial bridge on Xcode 26.6
+    if: github.repository == 'kristofferR/mpv-build' && github.event_name == 'workflow_dispatch' && inputs.bridge_only
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select and report Xcode 26.6
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+          xcrun swiftc -version
+      - name: Compile the pinned renderer and private bridge
+        shell: bash
+        run: |
+          command -v uv || brew install uv
+          source_dir="$RUNNER_TEMP/spatial-source"
+          mpv_dir="$RUNNER_TEMP/mpv-source"
+          output="$RUNNER_TEMP/spatial-check"
+          uv run --no-project python scripts/patches.py fetch-pinned spatialaudiobridge apple "$source_dir"
+          uv run --no-project python scripts/patches.py fetch-pinned mpv apple "$mpv_dir"
+          mkdir -p "$output"
+          printf 'import Foundation\nlet mpSpatialSilentAtmos = Data(base64Encoded: "%s")!\n' \
+            "$(base64 < "$source_dir/Sources/SpatialAudioPlayback/Resources/silent-atmos.mp4" | tr -d '\n')" > "$output/SpatialResources.swift"
+          sources=()
+          for name in Types Decoder APACEncoder SampleBuffer IEC61937Unpacker SpatialAudioRenderer SpatialAudioTranscoder FragmentTrim; do
+            sources+=("$source_dir/Sources/SpatialAudioBridge/$name.swift")
+          done
+          xcrun swiftc -swift-version 6 -O -whole-module-optimization -parse-as-library \
+            -emit-library -static -module-name MPVSpatial -target arm64-apple-macos11.0 \
+            -sdk "$(xcrun --sdk macosx --show-sdk-path)" -I "$source_dir/Rust/SpatialAudioCore/include" \
+            "${sources[@]}" "$source_dir/Sources/SpatialAudioPlayback/AtmosOutputActivator.swift" \
+            "$mpv_dir/audio/out/ao_spatial.swift" "$output/SpatialResources.swift" \
+            -o "$output/libmpv_spatial.a"
+          ls -lh "$output/libmpv_spatial.a"
+
   tests:
     name: Patch regression tests
     # The marker sits on this workflow's own commit, so the run it triggers
     # stops here instead of looping.
-    if: github.repository == 'kristofferR/mpv-build' && github.event_name == 'workflow_dispatch'
+    if: github.repository == 'kristofferR/mpv-build' && github.event_name == 'workflow_dispatch' && !inputs.bridge_only
     permissions:
       contents: read
     # The harnesses need only bash, python3 and cc (plus libass's host
