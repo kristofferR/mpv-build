@@ -28,6 +28,10 @@ on:
         description: Publish validated binaries and commit their manifest (requires coordinator approval)
         type: boolean
         default: false
+      inspect_run:
+        description: Inspect an existing run's packaged cores without rebuilding or publishing
+        type: string
+        default: ''
 
 # This validation branch only publishes Apple's artifacts to Kris's fork.
 env:
@@ -52,9 +56,33 @@ jobs:
       - name: Lint the dispatch workflow
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/publish.yml
 
+  inspect-archives:
+    name: Inspect packaged spatial cores
+    needs: workflow-check
+    if: inputs.inspect_run != '' && !inputs.publish
+    permissions:
+      contents: read
+      actions: read
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode 26.6
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.inspect_run }}
+          pattern: apple-*
+          path: ./dist/inspection
+      - name: Verify packaged core exports and deployment targets
+        run: |
+          command -v uv || brew install uv
+          uv run --no-project python scripts/inspect_spatial_packages.py dist/inspection
+
   bridge-check:
     name: Check spatial bridge on Xcode 26.6
     needs: workflow-check
+    if: inputs.inspect_run == ''
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
