@@ -347,8 +347,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install autoconf automake libtool ninja uv
+          brew install autoconf automake libtool ninja pkgconf wget uv
           uv tool install meson==1.4.2
+          # The Swift driver uses its own PATH, without ~/.local/bin.
+          ln -sf "$HOME/.local/bin/meson" "$(brew --prefix)/bin/meson"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # Only the stale libraries are compiled; the rest are restored from their
