@@ -29,7 +29,7 @@ on:
         type: boolean
         default: false
       inspect_run:
-        description: Inspect an existing run's packaged cores without rebuilding or publishing
+        description: Inspect and consumer-link an existing run's binaries without rebuilding libraries or publishing
         type: string
         default: ''
 
@@ -57,7 +57,7 @@ jobs:
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/publish.yml
 
   inspect-archives:
-    name: Inspect packaged spatial cores
+    name: Inspect packages and link consumers
     needs: workflow-check
     if: inputs.inspect_run != '' && !inputs.publish
     permissions:
@@ -66,8 +66,11 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
-      - name: Select Xcode 26.6
-        run: sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+      - name: Select and report Xcode 26.6
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+          xcrun swiftc -version
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
@@ -78,6 +81,19 @@ jobs:
         run: |
           command -v uv || brew install uv
           uv run --no-project python scripts/inspect_spatial_packages.py dist/inspection
+
+      - name: Merge and verify the existing platform binaries
+        run: |
+          uv run --no-project python scripts/merge_xcframeworks.py dist/inspection dist/release
+          bash scripts/test_build_date.sh dist/release/*.zip
+          uv run --no-project python scripts/keys.py record-frameworks --platform-group apple --release-dir dist/release
+          uv run --no-project python scripts/keys.py render --platform-group apple
+          uv run --no-project python scripts/keys.py verify --platform-group apple
+
+      - name: Link Objective-C-only SwiftPM consumers on iOS and tvOS
+        run: |
+          brew install xcodegen
+          bash scripts/test_spatial_swiftpm.sh dist/release
 
   bridge-check:
     name: Check spatial bridge on Xcode 26.6
