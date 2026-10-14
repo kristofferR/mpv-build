@@ -421,7 +421,7 @@ index 0000000..20d005c
 +
 +    private func resume(_ state: inout State) {
 +        if state.requested && !state.running && state.submitted > state.position && settled(state) {
-+            synchronizer.setRate(1)
++            synchronizer.setRate(1, time: .invalid)
 +            state.running = true
 +        }
 +    }
