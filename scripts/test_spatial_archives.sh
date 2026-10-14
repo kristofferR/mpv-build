@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Check the installed libmpv slices and link their sink with libdovi, without media.
+# Check installed slices and Swift/pkg-config consumer links with libdovi, without media.
 # Usage: test_spatial_archives.sh <patched-mpv> <platform>
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -7,6 +7,19 @@ source_dir="$1"
 platform="$2"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
+cat > "$work/consumer.m" <<'OBJC'
+#import <Foundation/Foundation.h>
+#include <mpv/client.h>
+int main(void) {
+    @autoreleasepool {
+        mpv_handle *player = mpv_create();
+        if (!player) return 1;
+        int result = mpv_initialize(player);
+        mpv_terminate_destroy(player);
+        return result < 0;
+    }
+}
+OBJC
 shopt -s nullglob
 archives=("$root/dist/libmpv/$platform/thin/"*/lib/libmpv.a)
 if (( ${#archives[@]} == 0 )); then
@@ -37,6 +50,48 @@ for archive in "${archives[@]}"; do
                 -framework AVFoundation -framework Foundation -framework CoreMedia \
                 -framework AudioToolbox -framework Accelerate -o "$work/test"
             echo "$platform/$arch: combined libmpv and force-loaded libdovi linked"
+
+            # Use the distributed metadata, including its configurable toolchain
+            # root. No Swift search paths may be supplied directly to Clang.
+            packaged_pc="$root/dist/release/libmpv/pkgconfig-example/$platform/$arch/mpv.pc"
+            grep -Fxq 'swift_toolchain=/path/to/Swift.xctoolchain' "$packaged_pc"
+            mkdir -p "$work/pkgconfig"
+            python3 - "$packaged_pc" "$work/pkgconfig/mpv.pc" "$root/dist" <<'PY'
+from pathlib import Path
+import sys
+source, destination, prefix = sys.argv[1:]
+Path(destination).write_text(Path(source).read_text().replace('/path/to/workdir', prefix))
+PY
+            swift_compiler="$(xcrun --find swiftc)"
+            swift_toolchain="$(dirname "$(dirname "$(dirname "$swift_compiler")")")"
+            ln -sfn "$swift_toolchain" "$work/Selected Xcode.xctoolchain"
+            pc_dirs="$work/pkgconfig"
+            for directory in "$root/dist/"*/"$platform/thin/$arch/lib/pkgconfig"; do
+                pc_dirs+=":$directory"
+            done
+            PKG_CONFIG_LIBDIR="$pc_dirs" PKG_CONFIG_PATH= PKG_CONFIG_SYSROOT_DIR= \
+                PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 pkg-config \
+                --define-variable="swift_toolchain=$work/Selected Xcode.xctoolchain" \
+                --static --cflags --libs mpv > "$work/consumer-flags.txt"
+            python3 - "$target" "$sdk_path" "$work" \
+                "$root/dist/libdovi/$platform/thin/$arch/lib/libdovi.a" <<'PY'
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+target, sdk, temporary, libdovi = sys.argv[1:]
+work = Path(temporary)
+flags = shlex.split((work / 'consumer-flags.txt').read_text())
+print(f'{target}: emitted pkg-config flags: {shlex.join(flags)}', flush=True)
+subprocess.run(['xcrun', 'clang', '-target', target, '-isysroot', sdk, '-fobjc-arc',
+                str(work / 'consumer.m'), '-Xlinker', '-force_load', '-Xlinker', libdovi,
+                *flags, '-o', str(work / 'consumer')], check=True)
+PY
+            xcrun nm -Uj "$work/consumer" > "$work/consumer-symbols.txt"
+            grep -q '^_mp_spatial_create$' "$work/consumer-symbols.txt"
+            xcrun otool -L "$work/consumer" > "$work/consumer-libraries.txt"
+            grep 'libswiftCore.dylib' "$work/consumer-libraries.txt"
+            echo "$platform/$arch: Clang consumer linked with packaged pkg-config flags and force-loaded libdovi"
             ;;
         *)
             if grep -Eq '^_(sab_|mp_spatial_)' "$work/exports.txt"; then
