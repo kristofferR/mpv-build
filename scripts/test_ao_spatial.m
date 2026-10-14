@@ -26,7 +26,8 @@ const char *af_fmt_to_str(int format) { return "spdif"; }
 
 struct fake_sink {
     struct mpv_global player;
-    bool refuse, ready, failed, defer_ready;
+    bool refuse, ready, failed, defer_ready, finished;
+    size_t capacity, pending;
     int codec;
     AVSampleBufferRenderSynchronizer *synchronizer;
     int begins, closes, ends, volumes;
@@ -45,17 +46,23 @@ void *mp_spatial_create(int codec, void *synchronizer)
     s->synchronizer = synchronizer;
     return s->refuse ? NULL : s;
 }
-void mp_spatial_begin(void *ctx, int64_t time)
+void mp_spatial_begin(void *ctx, int64_t time, size_t capacity)
 {
     struct fake_sink *s = ctx;
     s->begins++;
     s->begin_time = time;
+    s->capacity = capacity;
+    s->pending = 0;
+    s->finished = false;
     [s->received setLength:0];
 }
-void mp_spatial_write(void *ctx, const void *data, size_t size)
+bool mp_spatial_write(void *ctx, const void *data, size_t size)
 {
     [((struct fake_sink *)ctx)->received appendBytes:data length:size];
+    return true;
 }
+size_t mp_spatial_pending(void *ctx) { return ((struct fake_sink *)ctx)->pending; }
+bool mp_spatial_finished(void *ctx) { return ((struct fake_sink *)ctx)->finished; }
 bool mp_spatial_ready(void *ctx) { return ((struct fake_sink *)ctx)->ready; }
 bool mp_spatial_failed(void *ctx) { return ((struct fake_sink *)ctx)->failed; }
 void mp_spatial_destroy(void *ctx) { ((struct fake_sink *)ctx)->closes++; }
@@ -70,8 +77,10 @@ void mp_spatial_end(void *ctx)
 {
     struct fake_sink *s = ctx;
     s->ends++;
-    if (!s->defer_ready)
+    if (!s->defer_ready) {
         s->ready = true;
+        s->finished = true;
+    }
 }
 
 static int failures;
@@ -219,6 +228,27 @@ int main(void)
         st = state_of(ao);
         CHECK(!st.playing && st.delay == 0, "all audio played ends playback (%f)", st.delay);
 
+        // Space on the clock cannot grow an input queue whose feeder is stuck.
+        // A real write is never asked for more than free_samples, so it does
+        // not consume and drop an mpv frame merely because Swift is full.
+        s->pending = s->capacity;
+        st = state_of(ao);
+        CHECK(st.playing && st.free_samples == 0, "full feeder cannot admit more carrier or report underrun");
+        s->pending -= 3840 * 16;
+        CHECK(state_of(ao).free_samples == 3840, "only consumed input returns carrier credit");
+        s->pending = 0;
+
+        s->defer_ready = true;
+        end_of_stream(ao);
+        st = state_of(ao);
+        CHECK(st.playing && st.free_samples == 0, "a suspended final flush is not EOF even after clock drain");
+        s->finished = true;
+        st = state_of(ao);
+        CHECK(!st.playing && st.free_samples > 0, "finished and drained timeline releases next file");
+        p->ended = false;
+        s->defer_ready = false;
+        s->ends = 0;
+
         // Audio after an underrun would land in the past on the old timeline,
         // so it starts a new one, which waits for the renderer again.
         int begins = s->begins;
@@ -252,6 +282,7 @@ int main(void)
         // The production Swift feeder test covers readiness with no decoded
         // audio, including a tail that ends before a TrueHD major sync.
         s->ready = true;
+        s->finished = true;
         state_of(ao);
         CHECK(p->clock_running && p->synchronizer.rate == 1, "the clock starts once the renderer has flushed");
         CHECK(state_of(ao).free_samples == 0, "the next file waits until this one has played out");

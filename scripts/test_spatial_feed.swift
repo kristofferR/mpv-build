@@ -10,30 +10,41 @@ let mpSpatialSilentAtmos = Data()
 
 actor SpatialAudioRenderer {
     static let calls = Mutex((enqueues: 0, ends: 0))
+    static let gate = Mutex((enqueue: false, end: false))
+    static let delivered = Mutex<[Data]>([])
     private var enqueued = false
-    var isReadyToPlay: Bool { false }
+    private var ready = false
+    var isReadyToPlay: Bool { ready }
 
     init(codec: SpatialAudioCodec, synchronizer: AVSampleBufferRenderSynchronizer) throws {}
     func setVolume(_ volume: Float) {}
-    func begin(at time: CMTime) throws { enqueued = false }
+    func begin(at time: CMTime) throws { enqueued = false; ready = false }
     func enqueue(_ packet: Data, time: CMTime) async throws {
         Self.calls.withLock { $0.enqueues += 1 }
         if packet == Data([0x55]) {
-            // A reset must cancel an old feeder even while it is backpressured.
-            try await Task.sleep(for: .seconds(10))
+            while !Self.gate.withLock({ $0.enqueue }) {
+                try await Task.sleep(for: .milliseconds(2))
+            }
         }
+        try Task.checkCancellation()
+        Self.delivered.withLock { $0.append(packet) }
         enqueued = true
+        if packet == Data([0x42]) { ready = true }
     }
-    func endOfStream() throws {
+    func endOfStream() async throws {
         guard enqueued else { throw HarnessError.emptyRendererFlush }
+        while Self.gate.withLock({ $0.end }) {
+            try await Task.sleep(for: .milliseconds(2))
+        }
         Self.calls.withLock { $0.ends += 1 }
     }
 }
 
 @MainActor
 final class AtmosOutputActivator {
+    static var attachments = 0
     init(silentAtmosStream: URL) {}
-    func attach(to synchronizer: AVSampleBufferRenderSynchronizer) {}
+    func attach(to synchronizer: AVSampleBufferRenderSynchronizer) { Self.attachments += 1 }
     func detach() {}
 }
 
@@ -76,10 +87,45 @@ struct FeederChecks {
 
     static func write(_ bytes: Data, to sink: UnsafeMutableRawPointer) {
         guard !bytes.isEmpty else { return }
-        bytes.withUnsafeBytes { mpSpatialWrite(sink, $0.baseAddress!, $0.count) }
+        precondition(bytes.withUnsafeBytes { mpSpatialWrite(sink, $0.baseAddress!, $0.count) }, "input must fit the advertised capacity")
     }
 
     static func main() async throws {
+        // Hold the main actor while the independent feeder reaches EOF. The
+        // attachment task cannot run, so feeder completion alone is not ready.
+        let deferredSynchronizer = AVSampleBufferRenderSynchronizer()
+        guard let deferred = mpSpatialCreate(1, Unmanaged.passUnretained(deferredSynchronizer).toOpaque()) else {
+            preconditionFailure("deferred open failed")
+        }
+        mpSpatialBegin(deferred, 0, 512 * 1024)
+        write(dts(0x7f), to: deferred)
+        mpSpatialEnd(deferred)
+        let feederFinished = DispatchSemaphore(value: 0)
+        let observer = Task.detached {
+            while SpatialAudioRenderer.calls.withLock({ $0.ends }) == 0 {
+                try await Task.sleep(for: .milliseconds(2))
+            }
+            feederFinished.signal()
+        }
+        precondition(feederFinished.wait(timeout: .now() + 2) == .success, "feeder runs independently of main actor")
+        observer.cancel()
+        precondition(AtmosOutputActivator.attachments == 0 && !mpSpatialReady(deferred))
+        try await wait("deferred attachment") { mpSpatialReady(deferred) }
+        precondition(AtmosOutputActivator.attachments == 1)
+        mpSpatialDestroy(deferred)
+
+        // Closing before main-actor setup must not attach or revive the sink.
+        let closedSynchronizer = AVSampleBufferRenderSynchronizer()
+        guard let closed = mpSpatialCreate(1, Unmanaged.passUnretained(closedSynchronizer).toOpaque()) else {
+            preconditionFailure("closed open failed")
+        }
+        mpSpatialBegin(closed, 0, 512 * 1024)
+        mpSpatialDestroy(closed)
+        try await Task.sleep(for: .milliseconds(30))
+        precondition(AtmosOutputActivator.attachments == 1)
+        SpatialAudioRenderer.calls.withLock { $0 = (enqueues: 0, ends: 0) }
+        print("activator attachment gates readiness; closed setup cannot attach")
+
         let synchronizer = AVSampleBufferRenderSynchronizer()
         let pointer = Unmanaged.passUnretained(synchronizer).toOpaque()
         guard let sink = mpSpatialCreate(1, pointer) else { preconditionFailure("open failed") }
@@ -90,7 +136,7 @@ struct FeederChecks {
             ("MAT before major sync", matWithoutMajorSync()),
         ]
         for (name, bytes) in emptyTails {
-            mpSpatialBegin(sink, 0)
+            mpSpatialBegin(sink, 0, 512 * 1024)
             write(bytes, to: sink)
             mpSpatialEnd(sink)
             try await wait(name) { mpSpatialReady(sink) || mpSpatialFailed(sink) }
@@ -102,24 +148,55 @@ struct FeederChecks {
 
         // Nonempty decoded input still flushes before readiness, even when the
         // renderer never reports its normal startup threshold reached.
-        mpSpatialBegin(sink, 0)
+        mpSpatialBegin(sink, 0, 512 * 1024)
         write(dts(0x7f), to: sink)
         mpSpatialEnd(sink)
         try await wait("renderer flush") { mpSpatialReady(sink) || mpSpatialFailed(sink) }
         precondition(mpSpatialReady(sink) && !mpSpatialFailed(sink))
         precondition(SpatialAudioRenderer.calls.withLock { $0.ends } == 1)
 
-        mpSpatialBegin(sink, 0)
+        // Once playback is ready, a suspended renderer still holds its input
+        // credit. Fill exactly the byte bound, retry a refused write, then
+        // release the renderer and prove that accepted audio was not evicted.
+        mpSpatialBegin(sink, 0, 64)
+        write(dts(0x42), to: sink)
+        try await wait("startup ready") { mpSpatialReady(sink) && mpSpatialPending(sink) == 0 }
+        let countBeforeBlock = SpatialAudioRenderer.calls.withLock { $0.enqueues }
         write(dts(0x55), to: sink)
-        try await wait("backpressured feeder") { SpatialAudioRenderer.calls.withLock { $0.enqueues } == 2 }
-        mpSpatialBegin(sink, 0)
+        try await wait("enqueue suspended") { SpatialAudioRenderer.calls.withLock { $0.enqueues } == countBeforeBlock + 1 }
+        write(Data(repeating: 0, count: 64 - dts(0x55).count), to: sink)
+        precondition(mpSpatialPending(sink) == 64)
+        let refused = Data([0])
+        precondition(!refused.withUnsafeBytes { mpSpatialWrite(sink, $0.baseAddress!, $0.count) })
+        precondition(mpSpatialPending(sink) == 64 && !mpSpatialFailed(sink))
+        SpatialAudioRenderer.gate.withLock { $0.enqueue = true }
+        try await wait("credit returned") { mpSpatialPending(sink) == 0 }
+        write(refused, to: sink)
+        SpatialAudioRenderer.gate.withLock { $0.end = true }
+        mpSpatialEnd(sink)
+        try await wait("all input consumed") { mpSpatialPending(sink) == 0 }
+        try await Task.sleep(for: .milliseconds(30))
+        precondition(!mpSpatialFinished(sink), "EOF must wait for the suspended final flush")
+        SpatialAudioRenderer.gate.withLock { $0.end = false }
+        try await wait("final flush") { mpSpatialFinished(sink) }
+        precondition(SpatialAudioRenderer.delivered.withLock { $0.filter { $0 == Data([0x55]) }.count } == 1)
+        precondition(!refused.withUnsafeBytes { mpSpatialWrite(sink, $0.baseAddress!, $0.count) }, "finished input stays closed")
+        print("bounded input includes suspended enqueue; no eviction; EOF waits for final flush")
+
+        SpatialAudioRenderer.gate.withLock { $0.enqueue = false }
+        let beforeCancellation = SpatialAudioRenderer.calls.withLock { $0.enqueues }
+        mpSpatialBegin(sink, 0, 512 * 1024)
+        write(dts(0x55), to: sink)
+        try await wait("backpressured feeder") { SpatialAudioRenderer.calls.withLock { $0.enqueues } == beforeCancellation + 1 }
+        mpSpatialBegin(sink, 0, 512 * 1024)
         try await Task.sleep(for: .milliseconds(30))
         precondition(!mpSpatialReady(sink) && !mpSpatialFailed(sink), "cancelled generation cannot finish its replacement")
+        precondition(mpSpatialPending(sink) == 0 && !mpSpatialFinished(sink), "cancelled generation cannot return replacement credit")
         mpSpatialEnd(sink)
         try await wait("replacement EOF") { mpSpatialReady(sink) || mpSpatialFailed(sink) }
         precondition(mpSpatialReady(sink) && !mpSpatialFailed(sink))
 
-        mpSpatialBegin(sink, 0)
+        mpSpatialBegin(sink, 0, 512 * 1024)
         write(burst(type: 1, payload: []), to: sink)
         mpSpatialEnd(sink)
         try await wait("unsupported burst") { mpSpatialReady(sink) || mpSpatialFailed(sink) }

@@ -130,6 +130,22 @@ reproduce the merged assets already published under its name.
 
 ## How to build
 
+For Apple source builds, select the intended Xcode with `xcode-select` and
+install [rustup](https://rustup.rs/) first. Before `make build`, provision the
+compiler pinned by this checkout and the targets used by its spatial slices:
+
+```bash
+rust_version="$(sed -n 's/^rust=//p' toolchain/apple.txt)"
+test -n "$rust_version"
+rustup toolchain install "$rust_version" --profile minimal
+rustup target add --toolchain "$rust_version" \
+  aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
+  aarch64-apple-tvos aarch64-apple-tvos-sim
+```
+
+These are the same toolchain and target prerequisites installed by Apple CI.
+Repeat this setup after changing checkouts if their `rust` pin differs.
+
 ```bash
 make build
 # specified platforms (ios,macos,tvos,tvsimulator,isimulator,maccatalyst,xros,xrsimulator)

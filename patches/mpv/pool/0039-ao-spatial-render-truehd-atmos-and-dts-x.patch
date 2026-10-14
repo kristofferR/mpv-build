@@ -43,7 +43,7 @@ new file mode 100644
 index 0000000..599ef05
 --- /dev/null
 +++ b/audio/out/ao_spatial.h
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,16 @@
 +// Private interface between ao_spatial and its Swift renderer. Not installed.
 +#pragma once
 +#include <stdbool.h>
@@ -52,8 +52,10 @@ index 0000000..599ef05
 +
 +void *mp_spatial_create(int codec, void *synchronizer);
 +void mp_spatial_destroy(void *sink);
-+void mp_spatial_begin(void *sink, int64_t nanoseconds);
-+void mp_spatial_write(void *sink, const void *bytes, size_t size);
++void mp_spatial_begin(void *sink, int64_t nanoseconds, size_t capacity);
++bool mp_spatial_write(void *sink, const void *bytes, size_t size);
++size_t mp_spatial_pending(void *sink);
++bool mp_spatial_finished(void *sink);
 +void mp_spatial_end(void *sink);
 +bool mp_spatial_ready(void *sink);
 +bool mp_spatial_failed(void *sink);
@@ -63,7 +65,7 @@ new file mode 100644
 index 0000000..60d18bf
 --- /dev/null
 +++ b/audio/out/ao_spatial.m
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,306 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -169,7 +171,7 @@ index 0000000..60d18bf
 +    p->clock_running = false;
 +    p->ended = false;
 +    set_waiting(ao, false);
-+    mp_spatial_begin(p->sink, ns_from_time(p->timeline));
++    mp_spatial_begin(p->sink, ns_from_time(p->timeline), (size_t)ao->device_buffer * ao->sstride);
 +}
 +
 +static int init(struct ao *ao)
@@ -274,14 +276,15 @@ index 0000000..60d18bf
 +    // end (gapless playback goes on to the next file without a reset), the
 +    // renderer takes no more audio on it. Either way a new timeline begins, and
 +    // playback stays active: mpv calls start() only if it saw the underrun.
-+    if (p->ended || (p->clock_running && queued_ns(ao) == 0)) {
++    if (p->ended || (p->clock_running && queued_ns(ao) == 0 && !mp_spatial_pending(p->sink))) {
 +        MP_VERBOSE(ao, "beginning a new timeline\n");
 +        bool playing = p->playing;
 +        begin_timeline(ao);
 +        p->playing = playing;
 +        set_waiting(ao, playing);
 +    }
-+    mp_spatial_write(p->sink, data[0], (size_t)samples * ao->sstride);
++    if (!mp_spatial_write(p->sink, data[0], (size_t)samples * ao->sstride))
++        return false;
 +    p->written += samples;
 +    return true;
 +}
@@ -328,23 +331,31 @@ index 0000000..60d18bf
 +    }
 +
 +    int64_t queued = queued_ns(ao);
++    size_t pending = mp_spatial_pending(p->sink);
++    bool unfinished = p->ended && !mp_spatial_finished(p->sink);
 +
 +    // After the end mpv writes nothing until this timeline has played out, and
 +    // its thread would sleep a quarter of the buffer before noticing, holding
 +    // up EOF and a gapless next file. Paused, nothing plays out.
-+    bool draining = p->ended && !p->paused && queued > 0;
-+    if (p->ended && atomic_load(&p->waiting) != draining)
-+        set_waiting(ao, draining);
++    bool waiting = p->playing && !p->paused &&
++                   (!p->clock_running || pending || unfinished || (p->ended && queued > 0));
++    if (atomic_load(&p->waiting) != waiting)
++        set_waiting(ao, waiting);
 +
 +    state->queued_samples = queued * ao->samplerate / INT64_C(1000000000);
 +    int period = ao->samplerate / 100;
 +    state->free_samples = MPMAX(ao->device_buffer - state->queued_samples, 0)
 +                          / period * period;
++    // Wall-clock space cannot admit bytes that the feeder has not consumed.
++    // write() runs on this same AO thread; pending only decreases meanwhile.
++    size_t capacity = (size_t)ao->device_buffer * ao->sstride;
++    int feeder_space = pending < capacity ? (capacity - pending) / ao->sstride : 0;
++    state->free_samples = MPMIN(state->free_samples, feeder_space / period * period);
 +    // The next file's audio waits until this one has played out.
-+    if (p->ended && queued > 0)
++    if (p->ended && (queued > 0 || unfinished))
 +        state->free_samples = 0;
 +    state->delay = queued / 1e9;
-+    state->playing = p->playing && queued > 0;
++    state->playing = p->playing && (queued > 0 || pending || unfinished);
 +}
 +
 +const struct ao_driver audio_out_spatial = {
@@ -366,7 +377,7 @@ new file mode 100644
 index 0000000..20d005c
 --- /dev/null
 +++ b/audio/out/ao_spatial.swift
-@@ -0,0 +1,281 @@
+@@ -0,0 +1,330 @@
 +@preconcurrency import AVFoundation // Xcode 26 SDKs omit the synchronizer's Sendable annotation.
 +import Synchronization
 +
@@ -377,6 +388,10 @@ index 0000000..20d005c
 +    private struct Timeline {
 +        let input: AsyncStream<Data>.Continuation
 +        let feeder: Task<Void, Never>
++        let capacity: Int
++        var pending = 0
++        var ended = false
++        var finished = false
 +    }
 +
 +    private struct State {
@@ -427,10 +442,16 @@ index 0000000..20d005c
 +        }
 +    }
 +
-+    var ready: Bool { state.withLock { $0.readyGeneration == $0.generation } }
++    // Attachment installs the rate observer before C can start the clock.
++    // It does not assert that AVPlayer or the receiver has activated Atmos.
++    var ready: Bool {
++        state.withLock { $0.activator != nil && !$0.failed && $0.readyGeneration == $0.generation }
++    }
 +    var failed: Bool { state.withLock { $0.failed } }
++    var pending: Int { state.withLock { $0.timeline?.pending ?? 0 } }
++    var finished: Bool { state.withLock { $0.timeline?.finished ?? false } }
 +
-+    func begin(_ nanoseconds: Int64) {
++    func begin(_ nanoseconds: Int64, capacity: Int) {
 +        let time = CMTime(value: nanoseconds, timescale: 1_000_000_000)
 +        let (bursts, input) = AsyncStream<Data>.makeStream()
 +        state.withLock { state in
@@ -445,12 +466,32 @@ index 0000000..20d005c
 +                await self.feed(bursts, renderer: renderer, time: time,
 +                    previous: previous?.feeder, generation: generation)
 +            }
-+            state.timeline = Timeline(input: input, feeder: feeder)
++            state.timeline = Timeline(input: input, feeder: feeder, capacity: capacity)
 +        }
 +    }
 +
-+    func write(_ bytes: Data) { _ = state.withLock { $0.timeline }?.input.yield(bytes) }
-+    func end() { state.withLock { $0.timeline }?.input.finish() }
++    func write(_ bytes: Data) -> Bool {
++        state.withLock { state in
++            guard !state.failed, let timeline = state.timeline, !timeline.ended,
++                  bytes.count <= timeline.capacity - timeline.pending else { return false }
++            // Reserve through enqueue completion, including the chunk currently
++            // held by the feeder. A full queue never evicts an accepted burst.
++            state.timeline?.pending += bytes.count
++            switch timeline.input.yield(bytes) {
++            case .enqueued: return true
++            default:
++                state.timeline?.pending -= bytes.count
++                return false
++            }
++        }
++    }
++
++    func end() {
++        state.withLock { state in
++            state.timeline?.ended = true
++            state.timeline?.input.finish()
++        }
++    }
 +
 +    func setVolume(_ volume: Float) {
 +        state.withLock { state in
@@ -497,13 +538,18 @@ index 0000000..20d005c
 +            var ready = false
 +            var enqueued = false
 +            for await chunk in bursts {
++                try Task.checkCancellation()
 +                let stream = try unpacker.unpack(chunk)
-+                guard !stream.isEmpty else { continue }
-+                try await renderer.enqueue(stream, time: time + unpacker.skippedDuration)
-+                enqueued = true
-+                if !ready, await renderer.isReadyToPlay {
-+                    ready = true
-+                    markReady(generation)
++                if !stream.isEmpty {
++                    try await renderer.enqueue(stream, time: time + unpacker.skippedDuration)
++                    enqueued = true
++                    if !ready, await renderer.isReadyToPlay {
++                        ready = true
++                        markReady(generation)
++                    }
++                }
++                state.withLock { state in
++                    if state.generation == generation { state.timeline?.pending -= chunk.count }
 +                }
 +            }
 +            guard !Task.isCancelled else { return }
@@ -515,6 +561,9 @@ index 0000000..20d005c
 +            // Even an empty tail must let the carrier clock drain to EOF.
 +            // It may end before a major sync, or contain only filler/null bursts.
 +            markReady(generation)
++            state.withLock { state in
++                if state.generation == generation { state.timeline?.finished = true }
++            }
 +        } catch is CancellationError {
 +        } catch {
 +            fail(error, generation: generation)
@@ -623,12 +672,23 @@ index 0000000..20d005c
 +}
 +
 +@_cdecl("mp_spatial_begin")
-+func mpSpatialBegin(_ pointer: UnsafeMutableRawPointer, _ nanoseconds: Int64) {
-+    if #available(macOS 26, iOS 26, tvOS 26, *) { Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue().begin(nanoseconds) }
++func mpSpatialBegin(_ pointer: UnsafeMutableRawPointer, _ nanoseconds: Int64, _ capacity: Int) {
++    if #available(macOS 26, iOS 26, tvOS 26, *) { Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue().begin(nanoseconds, capacity: capacity) }
 +}
 +@_cdecl("mp_spatial_write")
-+func mpSpatialWrite(_ pointer: UnsafeMutableRawPointer, _ bytes: UnsafeRawPointer, _ size: Int) {
-+    if #available(macOS 26, iOS 26, tvOS 26, *) { Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue().write(Data(bytes: bytes, count: size)) }
++func mpSpatialWrite(_ pointer: UnsafeMutableRawPointer, _ bytes: UnsafeRawPointer, _ size: Int) -> Bool {
++    if #available(macOS 26, iOS 26, tvOS 26, *) { return Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue().write(Data(bytes: bytes, count: size)) }
++    return false
++}
++@_cdecl("mp_spatial_pending")
++func mpSpatialPending(_ pointer: UnsafeMutableRawPointer) -> Int {
++    if #available(macOS 26, iOS 26, tvOS 26, *) { return Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue().pending }
++    return 0
++}
++@_cdecl("mp_spatial_finished")
++func mpSpatialFinished(_ pointer: UnsafeMutableRawPointer) -> Bool {
++    if #available(macOS 26, iOS 26, tvOS 26, *) { return Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue().finished }
++    return false
 +}
 +@_cdecl("mp_spatial_end")
 +func mpSpatialEnd(_ pointer: UnsafeMutableRawPointer) {
