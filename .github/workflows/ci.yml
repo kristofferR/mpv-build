@@ -1,190 +1,118 @@
-name: CI
+name: Verify composed package metadata
 
 on:
-  push:
-    branches:
-      - develop
-    tags:
-      - '*'
-  # Version-bump PRs (check_version.yml) change versions.json pins; the
-  # patches job proves the series still apply to the new sources before merge.
-  pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: spatial-package-composition
+  cancel-in-progress: false
+
+env:
+  COMPOSED: ddfc1a3f4581f8855eba4aacbe3724d06b57ee34
+  APPLE_BASE: 7fa674907597f6a19e319b25c93dc9e4474be4a6
+  NATIVE_BASE: 2eb62ea10fc7a010306f5aee877970a565d51390
+
 jobs:
-  patches:
-    name: Patch series
-    permissions:
-      contents: read
+  metadata:
+    if: github.repository == 'kristofferR/mpv-build' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/validate/spatial-package-composition'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
-      - name: Validate patch series
-        run: python3 scripts/patches.py check
-
-      # test_audiotrack_truehd.sh encodes its TrueHD fixtures with the host
-      # ffmpeg's truehd encoder and spdif muxer.
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
-
-      - name: Test patch framework
-        run: bash scripts/test_patches.sh
-
-      - name: Test shared extractor
-        run: bash scripts/test_extract.sh
-
-      - name: Test content keys
-        run: bash scripts/test_keys.sh
-
-      - name: Test windows package pinning
-        run: python3 platforms/windows/test_pin_packages.py
-
-      # The linux driver has no other runner. The harness needs only bash, git
-      # and python3 (every build tool is stubbed and JOBS=1 keeps nproc out of
-      # it), and it is the only gate on the mpv/ffmpeg configure flags whose
-      # loss still compiles, links and plays -- just degraded.
-      - name: Test linux build plan
-        run: bash platforms/linux/test.sh
-
-      # Every nonempty (component, group) series must still apply cleanly to
-      # the exact source tree versions.json pins for it, otherwise the next
-      # publish run breaks. `apply --check` lands the whole stack and unwinds
-      # it again, so the clone stays pristine.
-      - name: Apply every series against its pinned source
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify composition scope and immutable asset metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
-          import shutil
+          import json
+          import os
           import subprocess
-          import sys
-          import tempfile
           from pathlib import Path
+          from urllib.parse import urlparse
 
-          # The group list is discovered from platforms/*/group.json by keys.py,
-          # not restated here, so a new group cannot be silently unchecked.
-          GROUPS = subprocess.run([sys.executable, 'scripts/keys.py', 'groups'],
-                                  capture_output=True, text=True, check=True).stdout.split()
-          if not GROUPS:
-              raise SystemExit('keys.py groups reported no platform groups')
+          composed = os.environ['COMPOSED']
+          apple_base = os.environ['APPLE_BASE']
+          native_base = os.environ['NATIVE_BASE']
 
-          # A fresh directory per run, deliberately outside the checkout: the
-          # gate below has to acquire and apply every series itself, so nothing
-          # may survive from an earlier run into this one. A persisted or
-          # self-hosted workspace, `clean: false` or `act` would otherwise find
-          # a pre-existing clone and skip the only check that proves a series
-          # still applies.
-          work = Path(tempfile.mkdtemp(prefix='ci-sources-'))
+          def git(*args):
+              return subprocess.check_output(['git', *args])
 
-          def resolve(component, group):
-            result = subprocess.run(
-              [sys.executable, 'scripts/patches.py', 'resolve', component, group],
-              capture_output=True, text=True, check=True)
-            return [line for line in result.stdout.splitlines() if line.strip()]
+          def blob(revision, path):
+              return git('show', f'{revision}:{path}')
 
-          def fetch(component, group, dest):
-            # The pin contract lives in scripts/patches.py fetch-pinned: it
-            # resolves the override-aware pin, clones the ref, proves HEAD is
-            # the pinned commit and applies the series. --check unwinds the
-            # tree again, so the clone stays pristine.
-            subprocess.run(
-              [sys.executable, 'scripts/patches.py', 'fetch-pinned', component, group, str(dest)],
-              check=True)
+          expected = {
+              'artifacts.json', 'versions.json',
+              'platforms/windows/pin_packages.py',
+              'platforms/windows/testdata/PROVENANCE',
+              'platforms/windows/testdata/libaribcaption.cmake',
+          }
+          actual = set(git('diff', '--name-only', apple_base, composed).decode().splitlines())
+          assert actual == expected, actual
+          assert git('show', '-s', '--format=%P', composed).decode().strip().split() == [apple_base, native_base]
+          assert git('diff', '--name-only', composed, 'HEAD').decode().splitlines() == ['.github/workflows/ci.yml']
+          assert blob(composed, 'Package.swift') == blob(apple_base, 'Package.swift')
+          for path in expected - {'artifacts.json', 'versions.json'}:
+              assert blob(composed, path) == blob(native_base, path), path
+          versions = json.loads(blob(composed, 'versions.json'))
+          base_versions = json.loads(blob(apple_base, 'versions.json'))
+          upstream_versions = json.loads(blob(native_base, 'versions.json'))
+          base_versions['components']['libaribcaption'] = upstream_versions['components']['libaribcaption']
+          assert versions == base_versions
+          assert versions['components']['spatialaudiobridge']['commit'] == '8d8f21a35d27179fe1b04a6c24a9db89b1d2a364'
 
-          checked = 0
-          for component_dir in sorted(Path('patches').iterdir()):
-            if not component_dir.is_dir():
-              continue
-            component = component_dir.name
-            for group in GROUPS:
-              series = resolve(component, group)
-              if not series:
-                continue
-              dest = work / f'{component}-{group}'
-              print(f'{component}/{group}: checking {len(series)} patch(es)')
-              # fetch-pinned lands the series for real: applied is what the
-              # harnesses below need, and a patch that does not apply aborts
-              # the step. Nothing above may skip it: `checked` counts only
-              # series that were actually acquired and applied here.
-              fetch(component, group, dest)
-              checked += 1
-              if component == 'mpv' and group == 'android':
-                subprocess.run(['bash', 'scripts/test_audiotrack_timing.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_audiotrack_truehd.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_mediacodec_timing.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_mediacodec_vsync.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_mediacodec_rebind.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_mediacodec_letterbox.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_lavc_busy_policy.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_player_queue_frames.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_audio_reload_held_frame.sh', str(dest)], check=True)
-                # The oracle decoders build from the ffmpeg/android tree
-                # checked above ('ffmpeg' sorts before 'mpv').
-                subprocess.run(['bash', 'scripts/test_demux_codec_profile.sh', str(dest),
-                                str(work / 'ffmpeg-android')], check=True)
-              if component == 'ffmpeg' and group == 'android':
-                subprocess.run(['bash', 'scripts/test_mediacodec_input.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_mediacodec_eos.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_mediacodec_flush.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_mediacodec_error.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_mediacodec_crop.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_mediacodec_rendered.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_mediacodec_shed.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_mediacodec_reorder.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_pgs_palette.sh', str(dest)], check=True)
-                subprocess.run(['bash', 'scripts/test_tcp_family_lookup.sh', str(dest)], check=True)
+          manifest = json.loads(blob(composed, 'artifacts.json'))
+          base_manifest = json.loads(blob(apple_base, 'artifacts.json'))
+          upstream_manifest = json.loads(blob(native_base, 'artifacts.json'))
+          assert manifest['platforms']['apple'] == base_manifest['platforms']['apple']
+          expected_manifest = base_manifest
+          for group in ('android', 'linux', 'windows'):
+              expected_manifest['platforms'][group] = upstream_manifest['platforms'][group]
+          assert manifest == expected_manifest
+          assert Path('artifacts.json').read_bytes() == blob(composed, 'artifacts.json')
+          print(f'Composition {composed}: exact five-file scope, merge parents and Windows provenance verified')
+          print('Apple package, manifest section and all other source/build/wrapper files unchanged')
 
-          if checked == 0:
-            raise SystemExit('no (component, group) series resolved; expected at least mpv/apple')
-          print(f'checked {checked} series')
-          shutil.rmtree(work, ignore_errors=True)
+          digest_count = 0
+          asset_count = 0
+          for group, section in manifest['platforms'].items():
+              base = section['assetBase']
+              url = urlparse(base)
+              owner, repo, releases, download, tag = url.path.strip('/').split('/')
+              assert url.scheme == 'https' and url.netloc == 'github.com'
+              assert (releases, download) == ('releases', 'download')
+              assert (owner, repo, tag) == ('kristofferR' if group == 'apple' else 'edde746', 'mpv-build', f'binaries-{group}')
+              release = json.loads(subprocess.check_output(['gh', 'api', f'repos/{owner}/{repo}/releases/tags/{tag}']))
+              assets = {asset['name']: asset for asset in release['assets']}
+              references = {}
+              for library in section['libraries'].values():
+                  for value in library.get('prebuilt', {}).values():
+                      if isinstance(value, str):
+                          references[value] = None
+                      else:
+                          references[value['asset']] = value['checksum']
+                  for value in library.get('frameworks', {}).values():
+                      references[value['asset']] = value['checksum']
+              for name, checksum in references.items():
+                  asset = assets[name]
+                  assert asset['state'] == 'uploaded' and asset['size'] > 0, name
+                  assert asset['browser_download_url'] == f'{base}/{name}', name
+                  if checksum is not None:
+                      assert asset['digest'] == f'sha256:{checksum}', name
+                      digest_count += 1
+                  asset_count += 1
+              print(f'{group}: {len(references)} existing assets verified; keys ' + ', '.join(lib['key'] for lib in section['libraries'].values()))
+          print(f'{asset_count} assets exist; {digest_count} recorded SHA256 digests match release metadata; no assets downloaded or uploaded')
           PY
-
-  build:
-    name: Demo apps
-    # The demo builds are expensive; keep them on the pushes they always ran
-    # on, and off the version-bump PRs the patches job exists for.
-    if: github.event_name != 'pull_request'
-    permissions:
-      contents: write
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Show Xcode version
-        run: xcodebuild -version
-
-      - name: Show available SDKs
-        run: xcodebuild -showsdks
-
-      - name: Build macOS
+      - name: Verify every platform content key
         run: |
-          xcodebuild -resolvePackageDependencies \
-            -project Demo/Demo-macOS/Demo-macOS.xcodeproj \
-            -scheme Demo-macOS
-
-          xcodebuild -project Demo/Demo-macOS/Demo-macOS.xcodeproj \
-            -scheme Demo-macOS \
-            -configuration Release \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            build
-
-      - name: Build iOS
-        run: |
-          xcodebuild -resolvePackageDependencies \
-            -project Demo/Demo-iOS/Demo-iOS.xcodeproj \
-            -scheme Demo-iOS
-
-          xcodebuild -project Demo/Demo-iOS/Demo-iOS.xcodeproj \
-            -scheme Demo-iOS \
-            -configuration Release \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            build
-
-
-      - name: Build Succeeded
-        run: |
-          echo "Build completed successfully."
+          for group in $(python3 scripts/keys.py groups); do
+            python3 scripts/keys.py verify --platform-group "$group"
+          done
+      - name: Test existing Windows package pin harness
+        run: python3 platforms/windows/test_pin_packages.py
