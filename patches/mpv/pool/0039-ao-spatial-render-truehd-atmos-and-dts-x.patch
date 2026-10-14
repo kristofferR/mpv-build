@@ -43,7 +43,7 @@ new file mode 100644
 index 0000000..599ef05
 --- /dev/null
 +++ b/audio/out/ao_spatial.h
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,19 @@
 +// Private interface between ao_spatial and its Swift renderer. Not installed.
 +#pragma once
 +#include <stdbool.h>
@@ -60,12 +60,15 @@ index 0000000..599ef05
 +bool mp_spatial_ready(void *sink);
 +bool mp_spatial_failed(void *sink);
 +void mp_spatial_volume(void *sink, float volume);
++int64_t mp_spatial_time(void *sink, bool playing, bool paused);
++int64_t mp_spatial_submitted(void *sink);
++bool mp_spatial_drained(void *sink);
 diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
 new file mode 100644
 index 0000000..60d18bf
 --- /dev/null
 +++ b/audio/out/ao_spatial.m
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,293 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -119,7 +122,6 @@ index 0000000..60d18bf
 +    int64_t written;
 +    bool playing;
 +    bool paused;
-+    bool clock_running;
 +    // The renderer has finished this timeline; the next write begins another.
 +    bool ended;
 +    bool reload_requested;
@@ -155,20 +157,21 @@ index 0000000..60d18bf
 +    // Split so that days of 192 kHz audio stay within int64.
 +    int64_t written = p->written / ao->samplerate * INT64_C(1000000000) +
 +                      p->written % ao->samplerate * INT64_C(1000000000) / ao->samplerate;
-+    int64_t now = ns_from_time(CMTimebaseGetTime(p->synchronizer.timebase));
-+    return MPMAX(ns_from_time(p->timeline) + written - now, 0);
++    int64_t now = mp_spatial_time(p->sink, p->playing, p->paused);
++    if (p->ended && mp_spatial_drained(p->sink))
++        return 0;
++    int64_t end = MPMAX(ns_from_time(p->timeline) + written, mp_spatial_submitted(p->sink));
++    return MPMAX(end - now, 0);
 +}
 +
 +static void begin_timeline(struct ao *ao)
 +{
 +    struct priv *p = ao->priv;
 +
-+    [p->synchronizer setRate:0];
-+    p->timeline = CMTimebaseGetTime(p->synchronizer.timebase);
++    p->timeline = CMTimeMake(mp_spatial_time(p->sink, false, false), 1000000000);
 +    p->written = 0;
 +    p->playing = false;
 +    p->paused = false;
-+    p->clock_running = false;
 +    p->ended = false;
 +    set_waiting(ao, false);
 +    mp_spatial_begin(p->sink, ns_from_time(p->timeline), (size_t)ao->device_buffer * ao->sstride);
@@ -238,7 +241,6 @@ index 0000000..60d18bf
 +    dispatch_release(p->wakeup_timer);
 +    dispatch_release(p->queue);
 +
-+    [p->synchronizer setRate:0];
 +    mp_spatial_destroy(p->sink);
 +    [p->synchronizer release];
 +}
@@ -253,7 +255,8 @@ index 0000000..60d18bf
 +    struct priv *p = ao->priv;
 +
 +    p->playing = true;
-+    set_waiting(ao, !p->paused && !p->clock_running);
++    mp_spatial_time(p->sink, p->playing, p->paused);
++    set_waiting(ao, !p->paused);
 +}
 +
 +static bool set_pause(struct ao *ao, bool paused)
@@ -261,9 +264,8 @@ index 0000000..60d18bf
 +    struct priv *p = ao->priv;
 +
 +    p->paused = paused;
-+    if (p->clock_running)
-+        [p->synchronizer setRate:paused ? 0 : 1];
-+    set_waiting(ao, p->playing && !paused && !p->clock_running);
++    mp_spatial_time(p->sink, p->playing, p->paused);
++    set_waiting(ao, p->playing && !paused);
 +    return true;
 +}
 +
@@ -271,12 +273,9 @@ index 0000000..60d18bf
 +{
 +    struct priv *p = ao->priv;
 +
-+    // After an underrun the clock has run past everything written, so
-+    // continuing that timeline would place new audio in the past. After the
-+    // end (gapless playback goes on to the next file without a reset), the
-+    // renderer takes no more audio on it. Either way a new timeline begins, and
-+    // playback stays active: mpv calls start() only if it saw the underrun.
-+    if (p->ended || (p->clock_running && queued_ns(ao) == 0 && !mp_spatial_pending(p->sink))) {
++    // An underrun holds the submitted-audio boundary without discarding
++    // encoder/parser state. Only a completed file needs a new timeline.
++    if (p->ended) {
 +        MP_VERBOSE(ao, "beginning a new timeline\n");
 +        bool playing = p->playing;
 +        begin_timeline(ao);
@@ -322,23 +321,14 @@ index 0000000..60d18bf
 +        ao_request_reload(ao);
 +    }
 +
-+    if (p->playing && !p->paused && !p->clock_running &&
-+        mp_spatial_ready(p->sink))
-+    {
-+        [p->synchronizer setRate:1 time:p->timeline];
-+        p->clock_running = true;
-+        set_waiting(ao, false);
-+    }
-+
 +    int64_t queued = queued_ns(ao);
 +    size_t pending = mp_spatial_pending(p->sink);
 +    bool unfinished = p->ended && !mp_spatial_finished(p->sink);
 +
-+    // After the end mpv writes nothing until this timeline has played out, and
-+    // its thread would sleep a quarter of the buffer before noticing, holding
-+    // up EOF and a gapless next file. Paused, nothing plays out.
-+    bool waiting = p->playing && !p->paused &&
-+                   (!p->clock_running || pending || unfinished || (p->ended && queued > 0));
++    // Recheck output progress while playing, including a renderer suspended
++    // after startup. Its submission hook also holds an overdue boundary before
++    // enqueueing more audio; a late AO wakeup cannot drop that next packet.
++    bool waiting = p->playing && !p->paused && (!p->ended || !mp_spatial_drained(p->sink));
 +    if (atomic_load(&p->waiting) != waiting)
 +        set_waiting(ao, waiting);
 +
@@ -355,7 +345,7 @@ index 0000000..60d18bf
 +    if (p->ended && (queued > 0 || unfinished))
 +        state->free_samples = 0;
 +    state->delay = queued / 1e9;
-+    state->playing = p->playing && (queued > 0 || pending || unfinished);
++    state->playing = p->playing && (!p->ended || !mp_spatial_drained(p->sink));
 +}
 +
 +const struct ao_driver audio_out_spatial = {
@@ -377,9 +367,102 @@ new file mode 100644
 index 0000000..20d005c
 --- /dev/null
 +++ b/audio/out/ao_spatial.swift
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,455 @@
 +@preconcurrency import AVFoundation // Xcode 26 SDKs omit the synchronizer's Sendable annotation.
 +import Synchronization
++
++// All rate changes and submissions share this lock. The reported position is
++// bounded by actual APAC output, not carrier bytes or encoder input. A late
++// submission first holds the timebase at the previous output boundary, so it
++// cannot extend a clock that has already run past the new audio.
++@available(macOS 26, iOS 26, tvOS 26, *)
++private final class SpatialClock: Sendable {
++    private struct State {
++        var generation = 0
++        var position = CMTime.zero
++        var submitted = CMTime.zero
++        var running = false
++        var requested = false
++    }
++    private let state = Mutex(State())
++    private let synchronizer: AVSampleBufferRenderSynchronizer
++
++    init(_ synchronizer: AVSampleBufferRenderSynchronizer) {
++        self.synchronizer = synchronizer
++        // The bridge gates startup itself, including short and empty EOF.
++        synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
++    }
++
++    func begin(at time: CMTime, generation: Int) {
++        state.withLock { state in
++            synchronizer.setRate(0, time: time)
++            state = State(generation: generation, position: time, submitted: time)
++        }
++    }
++
++    private func advance(_ state: inout State) {
++        if state.running {
++            state.position = max(state.position, min(synchronizer.currentTime(), state.submitted))
++            if state.position >= state.submitted {
++                synchronizer.setRate(0, time: state.position)
++                state.running = false
++            }
++        }
++    }
++
++    // setRate updates the timebase asynchronously. Do not enqueue or resume
++    // at a held boundary until the requested zero-rate anchor has landed.
++    private func settled(_ state: State) -> Bool {
++        if state.running { return true }
++        let observed = synchronizer.currentTime()
++        let anchor = CMTimeConvertScale(state.position, timescale: observed.timescale, method: .default)
++        return CMTimebaseGetRate(synchronizer.timebase) == 0 && observed == anchor
++    }
++
++    private func resume(_ state: inout State) {
++        if state.requested && !state.running && state.submitted > state.position && settled(state) {
++            synchronizer.setRate(1)
++            state.running = true
++        }
++    }
++
++    func position(playing: Bool) -> CMTime {
++        state.withLock { state in
++            advance(&state)
++            state.requested = playing
++            if !playing && state.running {
++                synchronizer.setRate(0, time: state.position)
++                state.running = false
++            }
++            resume(&state)
++            return state.position
++        }
++    }
++
++    var submitted: CMTime { state.withLock { $0.submitted } }
++    var drained: Bool { state.withLock { state in advance(&state); return state.position >= state.submitted } }
++
++    func submit(through end: CMTime, generation: Int, enqueue: @Sendable () -> Void) async throws {
++        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
++        while true {
++            try Task.checkCancellation()
++            let submitted = try state.withLock { state in
++                guard generation == state.generation else { throw CancellationError() }
++                advance(&state)
++                guard settled(state) else { return false }
++                enqueue()
++                state.submitted = max(state.submitted, end)
++                resume(&state)
++                return true
++            }
++            if submitted { return }
++            guard ContinuousClock.now < deadline else {
++                throw SpatialAudioError.invalidState("The audio clock did not settle at its held boundary")
++            }
++            try await Task.sleep(for: .milliseconds(1))
++        }
++    }
++}
 +
 +// Compiled with SpatialAudioBridge's renderer sources into libmpv. The C side
 +// owns this object and the synchronizer; asynchronous work never calls mpv.
@@ -407,8 +490,10 @@ index 0000000..20d005c
 +    }
 +
 +    private let state: Mutex<State>
++    private let clock: SpatialClock
 +
 +    init(codec: SpatialAudioCodec, synchronizer: AVSampleBufferRenderSynchronizer) throws {
++        clock = SpatialClock(synchronizer)
 +        let renderer = try SpatialAudioRenderer(codec: codec, synchronizer: synchronizer)
 +        try SpatialSession.acquire()
 +        state = Mutex(State(renderer: renderer))
@@ -450,6 +535,15 @@ index 0000000..20d005c
 +    var failed: Bool { state.withLock { $0.failed } }
 +    var pending: Int { state.withLock { $0.timeline?.pending ?? 0 } }
 +    var finished: Bool { state.withLock { $0.timeline?.finished ?? false } }
++    var submitted: Int64 { CMTimeConvertScale(clock.submitted, timescale: 1_000_000_000, method: .default).value }
++    var drained: Bool { state.withLock { ($0.timeline?.finished ?? false) && clock.drained } }
++    func time(playing: Bool, paused: Bool) -> Int64 {
++        state.withLock { state in
++            let ready = state.activator != nil && !state.failed && state.readyGeneration == state.generation
++            let time = clock.position(playing: playing && !paused && ready)
++            return CMTimeConvertScale(time, timescale: 1_000_000_000, method: .default).value
++        }
++    }
 +
 +    func begin(_ nanoseconds: Int64, capacity: Int) {
 +        let time = CMTime(value: nanoseconds, timescale: 1_000_000_000)
@@ -457,6 +551,7 @@ index 0000000..20d005c
 +        state.withLock { state in
 +            state.generation += 1
 +            let generation = state.generation
++            clock.begin(at: time, generation: generation)
 +            let previous = state.timeline
 +            previous?.input.finish()
 +            previous?.feeder.cancel()
@@ -508,6 +603,8 @@ index 0000000..20d005c
 +
 +    func close() {
 +        let old = state.withLock { state in
++            let position = clock.position(playing: false)
++            clock.begin(at: position, generation: state.generation + 1)
 +            defer { state = State(generation: state.generation + 1) }
 +            return state
 +        }
@@ -533,7 +630,9 @@ index 0000000..20d005c
 +            try await renderer.begin(at: time)
 +            await previous?.value
 +            try Task.checkCancellation()
-+            try await renderer.begin(at: time)
++            try await renderer.begin(at: time, submission: { [clock] end, enqueue in
++                try await clock.submit(through: end, generation: generation, enqueue: enqueue)
++            })
 +            var unpacker = IEC61937Unpacker()
 +            var ready = false
 +            var enqueued = false
@@ -558,8 +657,8 @@ index 0000000..20d005c
 +                try? unpacker.finish()
 +                try await renderer.endOfStream()
 +            }
-+            // Even an empty tail must let the carrier clock drain to EOF.
-+            // It may end before a major sync, or contain only filler/null bursts.
++            // An empty tail has no submitted audio to drain. Nonempty output
++            // remains playing until the clock reaches the last submitted buffer.
 +            markReady(generation)
 +            state.withLock { state in
 +                if state.generation == generation { state.timeline?.finished = true }
@@ -707,6 +806,22 @@ index 0000000..20d005c
 +@_cdecl("mp_spatial_volume")
 +func mpSpatialVolume(_ pointer: UnsafeMutableRawPointer, _ volume: Float) {
 +    if #available(macOS 26, iOS 26, tvOS 26, *) { Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue().setVolume(volume) }
++}
++
++@_cdecl("mp_spatial_time")
++func mpSpatialTime(_ pointer: UnsafeMutableRawPointer, _ playing: Bool, _ paused: Bool) -> Int64 {
++    if #available(macOS 26, iOS 26, tvOS 26, *) { return Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue().time(playing: playing, paused: paused) }
++    return 0
++}
++@_cdecl("mp_spatial_submitted")
++func mpSpatialSubmitted(_ pointer: UnsafeMutableRawPointer) -> Int64 {
++    if #available(macOS 26, iOS 26, tvOS 26, *) { return Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue().submitted }
++    return 0
++}
++@_cdecl("mp_spatial_drained")
++func mpSpatialDrained(_ pointer: UnsafeMutableRawPointer) -> Bool {
++    if #available(macOS 26, iOS 26, tvOS 26, *) { return Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue().drained }
++    return false
 +}
 diff --git a/audio/out/buffer.c b/audio/out/buffer.c
 index 277b524..a7e38f9 100644

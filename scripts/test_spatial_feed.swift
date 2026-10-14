@@ -4,7 +4,7 @@ import Synchronization
 // Only the decoder/encoder and activator are replaced. The complete production
 // bridge and the source-pinned IEC unpacker are compiled alongside this file.
 enum SpatialAudioCodec: UInt32 { case trueHD = 1, dtsHD = 2 }
-enum SpatialAudioError: Error { case decoding(String) }
+enum SpatialAudioError: Error { case decoding(String), invalidState(String) }
 enum HarnessError: Error { case timeout(String), emptyRendererFlush }
 let mpSpatialSilentAtmos = Data()
 
@@ -14,11 +14,20 @@ actor SpatialAudioRenderer {
     static let delivered = Mutex<[Data]>([])
     private var enqueued = false
     private var ready = false
+    typealias Submission = @Sendable (CMTime, @Sendable () -> Void) async throws -> Void
+    static let latestSubmission = Mutex<Submission?>(nil)
+    private var submission: Submission?
+    private var end = CMTime.zero
+    static let enqueueTimes = Mutex<[CMTime]>([])
+    private let synchronizer: AVSampleBufferRenderSynchronizer
     var isReadyToPlay: Bool { ready }
 
-    init(codec: SpatialAudioCodec, synchronizer: AVSampleBufferRenderSynchronizer) throws {}
+    init(codec: SpatialAudioCodec, synchronizer: AVSampleBufferRenderSynchronizer) throws { self.synchronizer = synchronizer }
     func setVolume(_ volume: Float) {}
-    func begin(at time: CMTime) throws { enqueued = false; ready = false }
+    func begin(at time: CMTime, submission: Submission? = nil) throws {
+        enqueued = false; ready = false; end = time; self.submission = submission
+        Self.latestSubmission.withLock { $0 = submission }
+    }
     func enqueue(_ packet: Data, time: CMTime) async throws {
         Self.calls.withLock { $0.enqueues += 1 }
         if packet == Data([0x55]) {
@@ -27,7 +36,16 @@ actor SpatialAudioRenderer {
             }
         }
         try Task.checkCancellation()
-        Self.delivered.withLock { $0.append(packet) }
+        // A synthetic packet produces 80 ms of output. This does not model
+        // decoder latency; the host must use this output horizon, not bytes.
+        end = end + CMTime(value: 80, timescale: 1000)
+        if let submission {
+            let synchronizer = self.synchronizer
+            try await submission(end) {
+                Self.delivered.withLock { $0.append(packet) }
+                Self.enqueueTimes.withLock { $0.append(synchronizer.currentTime()) }
+            }
+        } else { Self.delivered.withLock { $0.append(packet) } }
         enqueued = true
         if packet == Data([0x42]) { ready = true }
     }
@@ -182,6 +200,59 @@ struct FeederChecks {
         precondition(SpatialAudioRenderer.delivered.withLock { $0.filter { $0 == Data([0x55]) }.count } == 1)
         precondition(!refused.withUnsafeBytes { mpSpatialWrite(sink, $0.baseAddress!, $0.count) }, "finished input stays closed")
         print("bounded input includes suspended enqueue; no eviction; EOF waits for final flush")
+
+        // The production clock runs against real CoreMedia time, but the
+        // renderer supplies synthetic output boundaries and never emits audio.
+        mpSpatialBegin(sink, 0, 512 * 1024)
+        SpatialAudioRenderer.gate.withLock { $0.enqueue = false }
+        write(dts(0x42), to: sink)
+        try await wait("clock startup") { mpSpatialReady(sink) && mpSpatialPending(sink) == 0 }
+        precondition(mpSpatialSubmitted(sink) == 80_000_000)
+        _ = mpSpatialTime(sink, true, false)
+        write(dts(0x55), to: sink)
+        try await Task.sleep(for: .milliseconds(140)) // deliberately no AO polling
+        let held = mpSpatialTime(sink, true, false)
+        precondition(held == 80_000_000, "clock cannot report past submitted output")
+        try await Task.sleep(for: .milliseconds(30))
+        precondition(mpSpatialTime(sink, true, false) == held && !mpSpatialDrained(sink))
+        SpatialAudioRenderer.gate.withLock { $0.enqueue = true }
+        try await wait("late output") { mpSpatialPending(sink) == 0 }
+        precondition(mpSpatialSubmitted(sink) == 160_000_000)
+        let resumed = mpSpatialTime(sink, true, false)
+        precondition(resumed >= held && resumed < 160_000_000, "resume preserves the old boundary")
+        let paused = mpSpatialTime(sink, true, true)
+        try await Task.sleep(for: .milliseconds(50))
+        precondition(mpSpatialTime(sink, true, true) == paused, "pause holds the reported position")
+        _ = mpSpatialTime(sink, true, false)
+        mpSpatialEnd(sink)
+        try await wait("clock EOF") { _ = mpSpatialTime(sink, true, false); return mpSpatialDrained(sink) }
+        precondition(mpSpatialTime(sink, true, false) == 160_000_000)
+
+        // A submission arriving after a long AO scheduling gap must also hold
+        // the old boundary before extending it, without relying on get_state.
+        mpSpatialBegin(sink, 0, 512 * 1024)
+        SpatialAudioRenderer.gate.withLock { $0.enqueue = false }
+        write(dts(0x42), to: sink)
+        try await wait("second startup") { mpSpatialReady(sink) && mpSpatialPending(sink) == 0 }
+        _ = mpSpatialTime(sink, true, false)
+        write(dts(0x55), to: sink)
+        try await Task.sleep(for: .milliseconds(180))
+        SpatialAudioRenderer.gate.withLock { $0.enqueue = true }
+        try await wait("submission-held boundary") { mpSpatialPending(sink) == 0 }
+        let afterGap = mpSpatialTime(sink, true, false)
+        precondition(afterGap >= 80_000_000 && afterGap < 140_000_000, "late enqueue must not inherit elapsed wall time")
+        let staleSubmission = SpatialAudioRenderer.latestSubmission.withLock { $0! }
+        mpSpatialBegin(sink, 7_000_000_000, 512 * 1024)
+        let staleEnqueued = Mutex(false)
+        do {
+            try await staleSubmission(CMTime(value: 8, timescale: 1)) { staleEnqueued.withLock { $0 = true } }
+            preconditionFailure("stale submission must be cancelled")
+        } catch is CancellationError {}
+        precondition(!staleEnqueued.withLock { $0 })
+        mpSpatialEnd(sink)
+        try await wait("empty reset") { mpSpatialFinished(sink) }
+        precondition(mpSpatialDrained(sink) && mpSpatialTime(sink, true, false) == 7_000_000_000)
+        print("submitted APAC bounds clock across suspension, delayed AO polling, pause, EOF and empty reset")
 
         SpatialAudioRenderer.gate.withLock { $0.enqueue = false }
         let beforeCancellation = SpatialAudioRenderer.calls.withLock { $0.enqueues }

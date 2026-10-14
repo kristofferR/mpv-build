@@ -470,20 +470,26 @@ so the next AO opens; a reload with nothing held keeps the chain asked and drops
 nothing. Pass an already-patched source directory to run offline.
 
 Run the spatial audio output regression with `bash scripts/test_ao_spatial.sh`
-(macOS). It compiles `audio/out/ao_spatial.m` (patch 0039) against a real
-`AVSampleBufferRenderSynchronizer` and a fake renderer: TrueHD and DTS-HD
-bursts reach the renderer unchanged, the clock waits until the renderer is ready and
-then runs in real time, pause, seek, underrun and end of stream each keep or
-begin the right timeline, and a renderer failure latches the format so the reopen
-refuses it and mpv decodes the track, until that player probes PCM and clears
-its latch. A second player neither inherits nor clears that failure.
-Pass an already-patched source directory to run offline.
+(macOS). It checks admission, submitted-output accounting, empty EOF, gapless
+handoff, pause/reset and per-player fallback with a fake renderer.
+`bash scripts/test_spatial_feed.sh` exercises the complete production Swift
+bridge and pinned IEC unpacker with a fake renderer/activator, without media or
+audio output. It covers empty/filler/null/pre-major-sync EOF, bounded admission,
+suspended enqueue/final flush, delayed activator attachment, cancellation and
+errors. Its real CoreMedia clock checks output-boundary holds, delayed AO
+polling, late submission, pause/resume, empty reset and stale callbacks.
 
-`bash scripts/test_spatial_feed.sh` exercises the production Swift feeder and
-pinned IEC unpacker with a fake renderer and synthetic bursts, without media
-or audio output. Empty, filler, null and pre-major-sync tails must become ready
-at EOF, so the AO clock can drain; failures, flushing and cancelled generations
-remain distinct. The publish workflow runs this regression too.
+The Apple-only `spatialaudiobridge` patch adds a per-timeline submission hook.
+It brackets actual APAC buffer submission with the host clock lock; progress is
+the buffer's presentation end after encoder priming, not consumed IEC bytes.
+The reported position stops at that boundary during an underrun. Before a late
+buffer is enqueued, the synchronizer is held there and its asynchronous rate/time
+change must settle; playback then resumes without dropping decoder/encoder state.
+A 10 ms AO wakeup checks progress during playback. Final EOF waits for the feeder
+flush and submitted audio; an empty stream does not wait for a nonexistent audio
+clock. This does not measure device latency or certify receiver behavior.
+The patch participates in libmpv's Apple content key. The pinned SAB commit and
+Rust core are unchanged; this hook is compiled privately into MPVSpatial.
 
 The output is self-contained: `scripts/build_spatial.py` compiles the
 SpatialAudioBridge source commit in `versions.json`, with `cargo --locked` and

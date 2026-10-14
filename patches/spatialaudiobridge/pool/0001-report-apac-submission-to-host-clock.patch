@@ -1,0 +1,81 @@
+diff --git a/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift b/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift
+--- a/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift
++++ b/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift
+@@ -1,5 +1,5 @@
+ import Accelerate
+-import AVFoundation
++@preconcurrency import AVFoundation
+ 
+ /// Plays TrueHD Atmos or DTS:X as APAC through `AVSampleBufferAudioRenderer`, for players that
+ /// render video themselves with an `AVSampleBufferRenderSynchronizer`. No HLS or server is involved.
+@@ -30,6 +30,13 @@
+     private var inputStart: CMTime?
+     private var discarding: Int?
+     private var packets: Int64 = 0
++    // The host can serialize submission with its clock. Call enqueue once,
++    // within this invocation, or throw before calling it. begin invalidates
++    // any suspended submission from the old timeline.
++    public typealias Submission = @Sendable (CMTime, @Sendable () -> Void) async throws -> Void
++    private var submission: Submission?
++    private var submitting = false
++    private var refillAfterSubmission = false
+     /// Counts timelines, so a call suspended across ``begin(at:)`` drops its stale output.
+     private var generation = 0
+     private var state = State.accepting
+@@ -92,10 +99,13 @@
+     /// Starts a new timeline at `time`: before the first packet, after a seek, at a discontinuity
+     /// or after a failure. Queued audio is dropped. Then enqueue packets from a sync point at or
+     /// before `time`; audio before `time` is discarded so playback starts exactly there.
+-    public func begin(at time: CMTime) throws {
++    public func begin(at time: CMTime, submission: Submission? = nil) throws {
+         guard time.isNumeric else { throw SpatialAudioError.invalidConfiguration("The timeline must start at a finite time") }
+         if observers.isEmpty { observeOutput() }
+         generation += 1
++        self.submission = submission
++        submitting = false
++        refillAfterSubmission = false
+         audioRenderer.flush()
+         queued = []
+         refilling = false
+@@ -217,9 +227,29 @@
+             let start = CMTimeSubtract(CMTimeAdd(timeline, CMTime(value: packets * 1024, timescale: 48_000)),
+                                        CMTime(value: Int64(encoder.primingFrames), timescale: 48_000))
+             let buffer = try Self.sampleBuffer([packet.data], format: encoder.format, at: start)
+-            audioRenderer.enqueue(buffer)
++            let end = CMTimeAdd(start, CMTime(value: 1024, timescale: 48_000))
++            if let submission {
++                let renderer = audioRenderer
++                submitting = true
++                do {
++                    try await submission(end) { renderer.enqueue(buffer) }
++                } catch {
++                    if generation == current { submitting = false }
++                    throw error
++                }
++                guard generation == current else { throw CancellationError() }
++                submitting = false
++            } else {
++                audioRenderer.enqueue(buffer)
++            }
+             packets += 1
+             queued.append((buffer, start, CMTimeAdd(start, CMTime(value: 1024, timescale: 48_000)), packet.isIndependent))
++            // A route notification can arrive while the host awaits its clock
++            // anchor. Replay only after this submitted buffer is recorded.
++            if refillAfterSubmission {
++                refillAfterSubmission = false
++                requeue()
++            }
+         }
+         // Keep what has yet to play, from the sync packet it decodes from.
+         let now = synchronizer.currentTime()
+@@ -248,6 +278,10 @@
+     /// everything yet to play. Audio enqueued while the notification was on its way may have survived
+     /// the flush, so flush from that time first.
+     func refill(from time: CMTime?) {
++        if submitting {
++            refillAfterSubmission = true
++            return
++        }
+         guard state != .failed, !refilling, !queued.isEmpty else { return }
+         guard let time, time.isNumeric else { return requeue() }
+         let current = generation
