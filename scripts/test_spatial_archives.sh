@@ -43,9 +43,9 @@ for archive in "${archives[@]}"; do
                 tvsimulator) sdk=appletvsimulator; target="$arch-apple-tvos14.0-simulator" ;;
             esac
             sdk_path="$(xcrun --sdk "$sdk" --show-sdk-path)"
-            xcrun clang -target "$target" -isysroot "$sdk_path" -fobjc-arc -I"$source_dir" \
+            xcrun --sdk "$sdk" clang -target "$target" -isysroot "$sdk_path" -fobjc-arc -I"$source_dir" \
                 -c "$root/scripts/test_spatial_renderer.m" -o "$work/test.o"
-            xcrun swiftc -target "$target" -sdk "$sdk_path" "$work/test.o" "$archive" \
+            xcrun --sdk "$sdk" swiftc -target "$target" -sdk "$sdk_path" "$work/test.o" "$archive" \
                 -Xlinker -force_load -Xlinker "$root/dist/libdovi/$platform/thin/$arch/lib/libdovi.a" \
                 -framework AVFoundation -framework Foundation -framework CoreMedia \
                 -framework AudioToolbox -framework Accelerate -o "$work/test"
@@ -56,11 +56,31 @@ for archive in "${archives[@]}"; do
             packaged_pc="$root/dist/release/libmpv/pkgconfig-example/$platform/$arch/mpv.pc"
             grep -Fxq 'swift_toolchain=/path/to/Swift.xctoolchain' "$packaged_pc"
             mkdir -p "$work/pkgconfig"
-            python3 - "$packaged_pc" "$work/pkgconfig/mpv.pc" "$root/dist" <<'PY'
+            python3 - "$packaged_pc" "$work/pkgconfig" "$root/dist" "$sdk_path" <<'PY'
 from pathlib import Path
+import re
 import sys
-source, destination, prefix = sys.argv[1:]
-Path(destination).write_text(Path(source).read_text().replace('/path/to/workdir', prefix))
+source, destination, prefix, sdk = sys.argv[1:]
+destination, sdk = Path(destination), Path(sdk)
+(destination / 'mpv.pc').write_text(Path(source).read_text().replace('/path/to/workdir', prefix))
+# Apple SDKs supply these system libraries without .pc files. Describe only
+# the selected SDK, never Homebrew's host libraries or macOS header paths.
+for name, library, header, macro, include in [
+    ('zlib', 'z', 'zlib.h', 'ZLIB_VERSION', ''),
+    ('libxml-2.0', 'xml2', 'libxml2/libxml/xmlversion.h', 'LIBXML_DOTTED_VERSION', 'libxml2'),
+]:
+    stub = sdk / f'usr/lib/lib{library}.tbd'
+    if not stub.is_file():
+        raise SystemExit(f'Missing target SDK library: {stub}')
+    text = (sdk / 'usr/include' / header).read_text()
+    version = re.search(r'^#\s*define\s+' + macro + r'\s+"([^"]+)"', text, re.MULTILINE)
+    if not version:
+        raise SystemExit(f'Missing {macro} in target SDK header {header}')
+    (destination / f'{name}.pc').write_text(
+        f'Name: {name}\nDescription: Selected Apple SDK system library\n'
+        f'Version: {version[1]}\nLibs: -l{library}\n'
+        f'Cflags: -I"{sdk / "usr/include" / include}"\n')
+    print(f'{name} {version[1]}: {stub}', flush=True)
 PY
             swift_compiler="$(xcrun --find swiftc)"
             swift_toolchain="$(dirname "$(dirname "$(dirname "$swift_compiler")")")"
@@ -83,7 +103,7 @@ target, sdk, temporary, libdovi = sys.argv[1:]
 work = Path(temporary)
 flags = shlex.split((work / 'consumer-flags.txt').read_text())
 print(f'{target}: emitted pkg-config flags: {shlex.join(flags)}', flush=True)
-subprocess.run(['xcrun', 'clang', '-target', target, '-isysroot', sdk, '-fobjc-arc',
+subprocess.run(['xcrun', '--sdk', sdk, 'clang', '-target', target, '-isysroot', sdk, '-fobjc-arc',
                 str(work / 'consumer.m'), '-Xlinker', '-force_load', '-Xlinker', libdovi,
                 *flags, '-o', str(work / 'consumer')], check=True)
 PY
