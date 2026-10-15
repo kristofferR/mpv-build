@@ -68,7 +68,7 @@ new file mode 100644
 index 0000000..60d18bf
 --- /dev/null
 +++ b/audio/out/ao_spatial.m
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,292 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -273,8 +273,8 @@ index 0000000..60d18bf
 +{
 +    struct priv *p = ao->priv;
 +
-+    // An underrun holds the submitted-audio boundary without discarding
-+    // encoder/parser state. Only a completed file needs a new timeline.
++    // Timely holds preserve encoder/parser state. A missed horizon fails
++    // the sink and reloads PCM; only a completed file starts a new timeline.
 +    if (p->ended) {
 +        MP_VERBOSE(ao, "beginning a new timeline\n");
 +        bool playing = p->playing;
@@ -314,6 +314,7 @@ index 0000000..60d18bf
 +{
 +    struct priv *p = ao->priv;
 +
++    int64_t queued = queued_ns(ao);
 +    if (mp_spatial_failed(p->sink) && !p->reload_requested) {
 +        MP_WARN(ao, "the renderer failed to render the stream, falling back to PCM\n");
 +        p->reload_requested = true;
@@ -321,13 +322,11 @@ index 0000000..60d18bf
 +        ao_request_reload(ao);
 +    }
 +
-+    int64_t queued = queued_ns(ao);
 +    size_t pending = mp_spatial_pending(p->sink);
 +    bool unfinished = p->ended && !mp_spatial_finished(p->sink);
 +
-+    // Recheck output progress while playing, including a renderer suspended
-+    // after startup. Its submission hook also holds an overdue boundary before
-+    // enqueueing more audio; a late AO wakeup cannot drop that next packet.
++    // Recheck progress early enough to request a hold before coverage runs out.
++    // Missed holds fail closed instead of rewinding the physical clock.
 +    bool waiting = p->playing && !p->paused && (!p->ended || !mp_spatial_drained(p->sink));
 +    if (atomic_load(&p->waiting) != waiting)
 +        set_waiting(ao, waiting);
@@ -367,99 +366,196 @@ new file mode 100644
 index 0000000..20d005c
 --- /dev/null
 +++ b/audio/out/ao_spatial.swift
-@@ -0,0 +1,455 @@
+@@ -0,0 +1,547 @@
 +@preconcurrency import AVFoundation // Xcode 26 SDKs omit the synchronizer's Sendable annotation.
 +import Synchronization
 +
-+// All rate changes and submissions share this lock. The reported position is
-+// bounded by actual APAC output, not carrier bytes or encoder input. A late
-+// submission first holds the timebase at the previous output boundary, so it
-+// cannot extend a clock that has already run past the new audio.
++// Submission and rate changes share this lock. Ordinary holds preserve time;
++// an unfinished clock overrun is terminal, never repaired by moving it back.
 +@available(macOS 26, iOS 26, tvOS 26, *)
 +private final class SpatialClock: Sendable {
++    enum Failure: Error { case overrun, invalidTime, unsettled, insufficientLead }
++    private enum Mode { case anchoring, held, starting, running, stopping, failed }
 +    private struct State {
 +        var generation = 0
++        var origin = CMTime.zero
 +        var position = CMTime.zero
 +        var submitted = CMTime.zero
-+        var running = false
++        var mode = Mode.anchoring
++        var deadline: ContinuousClock.Instant? = ContinuousClock.now.advanced(by: .seconds(2))
 +        var requested = false
++        var hasPlayed = false
++        var hasSubmission = false
++        var leadDeadline: ContinuousClock.Instant?
++        var finalizing = false
++        var terminal = false
++        var overrunDuringFinalization = false
++        var failure: Failure?
 +    }
++    // Policies, not scheduling guarantees: missed deadlines fail closed.
++    private static let stopLead = CMTime(value: 100, timescale: 1000)
++    private static let resumeLead = CMTime(value: 250, timescale: 1000)
 +    private let state = Mutex(State())
 +    private let synchronizer: AVSampleBufferRenderSynchronizer
 +
 +    init(_ synchronizer: AVSampleBufferRenderSynchronizer) {
 +        self.synchronizer = synchronizer
-+        // The bridge gates startup itself, including short and empty EOF.
 +        synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
 +    }
 +
 +    func begin(at time: CMTime, generation: Int) {
 +        state.withLock { state in
++            // Only a new timeline may change the timebase anchor.
 +            synchronizer.setRate(0, time: time)
-+            state = State(generation: generation, position: time, submitted: time)
++            state = State(generation: generation, origin: time, position: time, submitted: time)
 +        }
 +    }
 +
-+    private func advance(_ state: inout State) {
-+        if state.running {
-+            state.position = max(state.position, min(synchronizer.currentTime(), state.submitted))
-+            if state.position >= state.submitted {
-+                synchronizer.setRate(0, time: state.position)
-+                state.running = false
++    private func fail(_ state: inout State, _ error: Failure) {
++        guard state.failure == nil else { return }
++        state.failure = error
++        state.mode = .failed
++        synchronizer.setRate(0, time: .invalid)
++    }
++
++    private func stop(_ state: inout State) {
++        guard state.mode == .running || state.mode == .starting else { return }
++        synchronizer.setRate(0, time: .invalid)
++        state.mode = .stopping
++        state.deadline = ContinuousClock.now.advanced(by: .seconds(2))
++    }
++
++    private func beyond(_ raw: CMTime, _ horizon: CMTime) -> Bool {
++        // Allow only the rounding needed to express the endpoint in the raw
++        // clock's timescale, never the scheduling safety margin.
++        raw > CMTimeConvertScale(horizon, timescale: raw.timescale, method: .roundTowardPositiveInfinity)
++    }
++
++    private func observe(_ state: inout State, strict: Bool = false) {
++        guard state.failure == nil else { return }
++        let raw = synchronizer.currentTime()
++        guard raw.isNumeric && raw.timescale > 0 else { fail(&state, .invalidTime); return }
++        let rate = CMTimebaseGetRate(synchronizer.timebase)
++        if state.mode == .anchoring {
++            let origin = CMTimeConvertScale(state.origin, timescale: raw.timescale, method: .default)
++            if rate == 0 && raw == origin { state.mode = .held; state.deadline = nil }
++        } else {
++            if state.hasPlayed && !state.terminal &&
++                (state.overrunDuringFinalization || beyond(raw, state.submitted)) {
++                if state.finalizing && !strict {
++                    // Empty final encoding may legitimately leave no more audio.
++                    // No new submission is admitted under this exception.
++                    state.overrunDuringFinalization = true
++                    stop(&state)
++                } else { fail(&state, .overrun); return }
++            }
++            state.position = max(state.position, min(raw, state.submitted))
++            if state.mode == .stopping && rate == 0 {
++                state.mode = .held; state.deadline = nil
++            } else if state.mode == .starting && rate != 0 {
++                state.mode = .running; state.deadline = nil
++            }
++            if !state.requested ||
++                (state.terminal ? raw >= state.submitted : state.submitted - raw <= Self.stopLead) {
++                stop(&state)
 +            }
 +        }
-+    }
-+
-+    // setRate updates the timebase asynchronously. Do not enqueue or resume
-+    // at a held boundary until the requested zero-rate anchor has landed.
-+    private func settled(_ state: State) -> Bool {
-+        if state.running { return true }
-+        let observed = synchronizer.currentTime()
-+        let anchor = CMTimeConvertScale(state.position, timescale: observed.timescale, method: .default)
-+        return CMTimebaseGetRate(synchronizer.timebase) == 0 && observed == anchor
++        if let deadline = state.deadline, ContinuousClock.now >= deadline { fail(&state, .unsettled) }
 +    }
 +
 +    private func resume(_ state: inout State) {
-+        if state.requested && !state.running && state.submitted > state.position && settled(state) {
-+            synchronizer.setRate(1, time: .invalid)
-+            state.running = true
++        guard state.failure == nil, state.mode == .held, state.requested,
++              !state.overrunDuringFinalization else { return }
++        let lead = state.submitted - state.position
++        // Finished output may drain a short final tail. Unfinished output needs
++        // enough lead to avoid resuming once for every single APAC packet.
++        guard state.terminal ? lead > .zero : lead >= Self.resumeLead else {
++            // The framework promises no minimum queue capacity. If it refuses
++            // more data below our policy lead, polling must fail rather than
++            // wait forever for the suspended encoder batch/flush to return.
++            if state.hasSubmission && !state.terminal {
++                if state.leadDeadline == nil {
++                    state.leadDeadline = ContinuousClock.now.advanced(by: .seconds(2))
++                }
++                if let deadline = state.leadDeadline, ContinuousClock.now >= deadline {
++                    fail(&state, .insufficientLead)
++                }
++            }
++            return
 +        }
++        state.leadDeadline = nil
++        synchronizer.setRate(1, time: .invalid)
++        state.mode = .starting
++        state.deadline = ContinuousClock.now.advanced(by: .seconds(2))
++        state.hasPlayed = true
 +    }
 +
 +    func position(playing: Bool) -> CMTime {
 +        state.withLock { state in
-+            advance(&state)
 +            state.requested = playing
-+            if !playing && state.running {
-+                synchronizer.setRate(0, time: state.position)
-+                state.running = false
-+            }
++            if !playing { state.leadDeadline = nil }
++            observe(&state)
 +            resume(&state)
 +            return state.position
 +        }
 +    }
 +
++    var failure: Failure? { state.withLock { $0.failure } }
++    var ready: Bool {
++        state.withLock { state in
++            state.failure == nil && (state.terminal || state.hasPlayed ||
++                state.submitted - state.position >= Self.resumeLead)
++        }
++    }
 +    var submitted: CMTime { state.withLock { $0.submitted } }
-+    var drained: Bool { state.withLock { state in advance(&state); return state.position >= state.submitted } }
++    var drained: Bool {
++        state.withLock { state in
++            observe(&state)
++            return state.failure == nil && state.terminal && state.position >= state.submitted
++        }
++    }
 +
-+    func submit(through end: CMTime, generation: Int, enqueue: @Sendable () -> Void) async throws {
-+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
-+        while true {
-+            try Task.checkCancellation()
-+            let submitted = try state.withLock { state in
-+                guard generation == state.generation else { throw CancellationError() }
-+                advance(&state)
-+                guard settled(state) else { return false }
-+                enqueue()
-+                state.submitted = max(state.submitted, end)
-+                resume(&state)
-+                return true
++    func beginFinalization(generation: Int) {
++        state.withLock { state in
++            guard state.generation == generation, state.failure == nil else { return }
++            state.finalizing = true
++            observe(&state)
++        }
++    }
++
++    func finishEmpty(generation: Int) throws {
++        try state.withLock { state in
++            guard state.generation == generation else { throw CancellationError() }
++            observe(&state)
++            if let failure = state.failure { throw failure }
++            state.terminal = true
++            state.leadDeadline = nil
++            state.finalizing = false
++            state.overrunDuringFinalization = false
++            observe(&state)
++            resume(&state)
++        }
++    }
++
++    func submit(through end: CMTime, isFinal: Bool, generation: Int, enqueue: () -> Void) throws -> Bool {
++        try state.withLock { state in
++            guard state.generation == generation else { throw CancellationError() }
++            guard end.isNumeric, !state.terminal else {
++                fail(&state, .invalidTime); throw Failure.invalidTime
 +            }
-+            if submitted { return }
-+            guard ContinuousClock.now < deadline else {
-+                throw SpatialAudioError.invalidState("The audio clock did not settle at its held boundary")
-+            }
-+            try await Task.sleep(for: .milliseconds(1))
++            // Even the final packet must respect OLD coverage. A late final
++            // packet cannot turn a preceding overrun into successful draining.
++            observe(&state, strict: true)
++            if let failure = state.failure { throw failure }
++            if state.mode == .anchoring || state.mode == .stopping { return false }
++            enqueue()
++            observe(&state, strict: true) // framework enqueue can take time
++            if let failure = state.failure { throw failure }
++            state.submitted = max(state.submitted, end) // includes origin for priming-only output
++            state.hasSubmission = true
++            if isFinal { state.terminal = true; state.finalizing = false; state.leadDeadline = nil }
++            resume(&state)
++            return true
 +        }
 +    }
 +}
@@ -481,7 +577,6 @@ index 0000000..20d005c
 +        var renderer: SpatialAudioRenderer?
 +        var timeline: Timeline?
 +        var generation = 0
-+        var readyGeneration = -1
 +        var failed = false
 +        var volume: Float = 1
 +        var volumeUpdate: Task<Void, Never>?
@@ -528,19 +623,20 @@ index 0000000..20d005c
 +    }
 +
 +    // Attachment installs the rate observer before C can start the clock.
-+    // It does not assert that AVPlayer or the receiver has activated Atmos.
++    // Submitted output publishes readiness even while an encoder batch/flush
++    // is suspended on a full renderer queue. This is not receiver readiness.
 +    var ready: Bool {
-+        state.withLock { $0.activator != nil && !$0.failed && $0.readyGeneration == $0.generation }
++        state.withLock { $0.activator != nil && !$0.failed && clock.ready }
 +    }
-+    var failed: Bool { state.withLock { $0.failed } }
++    var failed: Bool { state.withLock { $0.failed || clock.failure != nil } }
 +    var pending: Int { state.withLock { $0.timeline?.pending ?? 0 } }
 +    var finished: Bool { state.withLock { $0.timeline?.finished ?? false } }
 +    var submitted: Int64 { CMTimeConvertScale(clock.submitted, timescale: 1_000_000_000, method: .default).value }
 +    var drained: Bool { state.withLock { ($0.timeline?.finished ?? false) && clock.drained } }
 +    func time(playing: Bool, paused: Bool) -> Int64 {
 +        state.withLock { state in
-+            let ready = state.activator != nil && !state.failed && state.readyGeneration == state.generation
-+            let time = clock.position(playing: playing && !paused && ready)
++            let attached = state.activator != nil && !state.failed
++            let time = clock.position(playing: playing && !paused && attached)
 +            return CMTimeConvertScale(time, timescale: 1_000_000_000, method: .default).value
 +        }
 +    }
@@ -567,7 +663,7 @@ index 0000000..20d005c
 +
 +    func write(_ bytes: Data) -> Bool {
 +        state.withLock { state in
-+            guard !state.failed, let timeline = state.timeline, !timeline.ended,
++            guard !state.failed, clock.failure == nil, let timeline = state.timeline, !timeline.ended,
 +                  bytes.count <= timeline.capacity - timeline.pending else { return false }
 +            // Reserve through enqueue completion, including the chunk currently
 +            // held by the feeder. A full queue never evicts an accepted burst.
@@ -630,11 +726,12 @@ index 0000000..20d005c
 +            try await renderer.begin(at: time)
 +            await previous?.value
 +            try Task.checkCancellation()
-+            try await renderer.begin(at: time, submission: { [clock] end, enqueue in
-+                try await clock.submit(through: end, generation: generation, enqueue: enqueue)
++            try await renderer.begin(at: time, submission: { [clock] end, isFinal, enqueue in
++                try clock.submit(through: end, isFinal: isFinal, generation: generation, enqueue: enqueue)
++            }, completion: { [clock] in
++                try clock.finishEmpty(generation: generation)
 +            })
 +            var unpacker = IEC61937Unpacker()
-+            var ready = false
 +            var enqueued = false
 +            for await chunk in bursts {
 +                try Task.checkCancellation()
@@ -642,24 +739,22 @@ index 0000000..20d005c
 +                if !stream.isEmpty {
 +                    try await renderer.enqueue(stream, time: time + unpacker.skippedDuration)
 +                    enqueued = true
-+                    if !ready, await renderer.isReadyToPlay {
-+                        ready = true
-+                        markReady(generation)
-+                    }
 +                }
 +                state.withLock { state in
 +                    if state.generation == generation { state.timeline?.pending -= chunk.count }
 +                }
 +            }
 +            guard !Task.isCancelled else { return }
++            clock.beginFinalization(generation: generation)
 +            if enqueued {
 +                // A partial final IEC unit does not discard already decoded audio.
 +                try? unpacker.finish()
 +                try await renderer.endOfStream()
++            } else {
++                try clock.finishEmpty(generation: generation)
 +            }
 +            // An empty tail has no submitted audio to drain. Nonempty output
 +            // remains playing until the clock reaches the last submitted buffer.
-+            markReady(generation)
 +            state.withLock { state in
 +                if state.generation == generation { state.timeline?.finished = true }
 +            }
@@ -667,10 +762,6 @@ index 0000000..20d005c
 +        } catch {
 +            fail(error, generation: generation)
 +        }
-+    }
-+
-+    private func markReady(_ generation: Int) {
-+        state.withLock { if $0.generation == generation { $0.readyGeneration = generation } }
 +    }
 +
 +    private func fail(_ error: Error, generation: Int? = nil) {

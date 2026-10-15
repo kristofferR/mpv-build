@@ -476,20 +476,45 @@ handoff, pause/reset and per-player fallback with a fake renderer.
 bridge and pinned IEC unpacker with a fake renderer/activator, without media or
 audio output. It covers empty/filler/null/pre-major-sync EOF, bounded admission,
 suspended enqueue/final flush, delayed activator attachment, cancellation and
-errors. Its real CoreMedia clock checks output-boundary holds, delayed AO
-polling, late submission, pause/resume, empty reset and stale callbacks.
+errors. Its real CoreMedia clock checks early holds, terminal late submission,
+pause/reset, finalization races, empty/priming-only output and stale callbacks.
+`bash scripts/test_spatial_submission.sh` compiles the complete patched renderer
+with synthetic codec/output doubles. It checks true/false/throw admission,
+invocation counts, cancellation/reset, pending route refill, final events and
+queues filling mid-batch/below the resume lead. This focused Swift 6 harness
+treats compiler warnings as errors.
+Neither test opens an audio device or establishes receiver behavior.
 
-The Apple-only `spatialaudiobridge` patch adds a per-timeline submission hook.
-It brackets actual APAC buffer submission with the host clock lock; progress is
-the buffer's presentation end after encoder priming, not consumed IEC bytes.
-The reported position stops at that boundary during an underrun. Before a late
-buffer is enqueued, the synchronizer is held there and its asynchronous rate/time
-change must settle; playback then resumes without dropping decoder/encoder state.
-A 10 ms AO wakeup checks progress during playback. Final EOF waits for the feeder
-flush and submitted audio; an empty stream does not wait for a nonexistent audio
-clock. This does not measure device latency or certify receiver behavior.
-The patch participates in libmpv's Apple content key. The pinned SAB commit and
-Rust core are unchanged; this hook is compiled privately into MPVSpatial.
+The Apple-only `spatialaudiobridge` patch adds a synchronous per-timeline
+submission hook. Its nonescaping enqueue closure stays on the renderer actor;
+refusal retries asynchronously outside the callback and host lock. The host
+serializes actual enqueue with clock checks. Progress is the APAC presentation
+end after encoder priming, not consumed IEC bytes. Both sides of enqueue check
+OLD coverage; a late packet cannot conceal an earlier underrun.
+
+Ordinary holds preserve the synchronizer anchor. A 10 ms AO wakeup requests a
+stop with 100 ms of coverage remaining; unfinished playback resumes with at
+least 250 ms of coverage. Readiness comes from submitted playable output, not
+completion of an encoder batch or final flush. Apple specifies no minimum queue
+capacity: a held, requested timeline with submitted buffers but insufficient
+lead fails to PCM after two seconds, including a queue full of priming buffers.
+Pausing cancels this wait; final completion releases short tails. These are
+scheduling policies, not timing or queue-capacity guarantees.
+A missed horizon is terminal: stop, reject further data and request mpv's
+same-track PCM fallback. This may interrupt playback, require resynchronization
+and lose Atmos/object output. A later device reload or track change can retry
+spatial audio; seamless underrun recovery is not promised.
+
+The final encoder packet atomically declares the terminal horizon with enqueue;
+a zero-output completion declares the existing horizon terminal. During final
+encoding only, an exhausted horizon is held provisionally: empty completion may
+drain it, but any later packet still fails the old-coverage check. Final tails
+bypass the normal resume-lead policy. Reset/cancellation suppress old callbacks,
+and route replay does not add submission credit. Asynchronous route-flush
+interruptions and hardware continuity remain unvalidated. This does not measure device
+latency, lip-sync, placement or endurance. The patch participates in libmpv's
+Apple content key. The SAB pin and Rust core are unchanged; the hook is compiled
+privately into MPVSpatial.
 
 The output is self-contained: `scripts/build_spatial.py` compiles the
 SpatialAudioBridge source commit in `versions.json`, with `cargo --locked` and
