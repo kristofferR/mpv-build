@@ -1,7 +1,7 @@
 diff --git a/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift b/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift
 --- a/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift
 +++ b/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift
-@@ -30,6 +30,17 @@
+@@ -30,6 +30,20 @@
      private var inputStart: CMTime?
      private var discarding: Int?
      private var packets: Int64 = 0
@@ -16,10 +16,13 @@ diff --git a/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift b/Sources/Spa
 +    public typealias Completion = @Sendable () throws -> Void
 +    private var submission: Submission?
 +    private var completion: Completion?
++    // Actor-owned only during a synchronous admission attempt. The host's
++    // closure captures self, never a local non-Sendable sample buffer.
++    private var admissionBuffer: CMSampleBuffer?
      /// Counts timelines, so a call suspended across ``begin(at:)`` drops its stale output.
      private var generation = 0
      private var state = State.accepting
-@@ -92,10 +103,12 @@
+@@ -92,10 +106,12 @@
      /// Starts a new timeline at `time`: before the first packet, after a seek, at a discontinuity
      /// or after a failure. Queued audio is dropped. Then enqueue packets from a sync point at or
      /// before `time`; audio before `time` is discarded so playback starts exactly there.
@@ -33,7 +36,7 @@ diff --git a/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift b/Sources/Spa
          audioRenderer.flush()
          queued = []
          refilling = false
-@@ -145,6 +158,7 @@
+@@ -145,6 +161,7 @@
              try Task.checkCancellation()
              let blocks = try decoder.decode(UnsafeRawBufferPointer(start: nil, count: 0), end: true)
              try await play(blocks, final: true, generation: current)
@@ -41,7 +44,7 @@ diff --git a/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift b/Sources/Spa
              state = .ended
          } catch {
              if generation == current { state = .failed }
-@@ -176,7 +190,7 @@
+@@ -176,7 +193,7 @@
                               generation: current)
              discarding = remaining + frames
          }
@@ -50,7 +53,7 @@ diff --git a/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift b/Sources/Spa
      }
  
      /// Interleaved PCM aligned to the timeline, with audio before it discarded and the gain applied.
-@@ -200,24 +214,40 @@
+@@ -200,24 +217,33 @@
  
      /// Enqueues packets with timestamps shifted back by the encoder priming, so decoded audio lands
      /// at its presentation time, as the asset-writer path does.
@@ -86,15 +89,8 @@ diff --git a/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift b/Sources/Spa
 +                    // A refusal yields the actor: begin, cancellation, renderer
 +                    // failure or a route refill may have intervened on every retry.
 +                    try await waitUntilReady(generation: current)
-+                    var calls = 0
-+                    let accepted = try submission(end, final && index == encoded.count - 1) {
-+                        calls += 1
-+                        // Never enqueue twice, even if a host breaks its contract.
-+                        if calls == 1 { audioRenderer.enqueue(buffer) }
-+                    }
-+                    guard calls == (accepted ? 1 : 0) else {
-+                        throw SpatialAudioError.invalidState("Invalid submission admission result")
-+                    }
++                    let accepted = try admit(buffer, through: end,
++                        isFinal: final && index == encoded.count - 1, using: submission)
 +                    if accepted { break }
 +                    try await Task.sleep(for: .milliseconds(5))
 +                }
@@ -104,11 +100,33 @@ diff --git a/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift b/Sources/Spa
              packets += 1
              queued.append((buffer, start, CMTimeAdd(start, CMTime(value: 1024, timescale: 48_000)), packet.isIndependent))
          }
-@@ -226,6 +256,16 @@
+@@ -226,6 +252,38 @@
          if let unplayed = queued.firstIndex(where: { $0.end > now }),
             let sync = queued[...unplayed].lastIndex(where: \.isIndependent), sync > 0 {
              queued.removeFirst(sync)
 +        }
++    }
++
++    private func admit(_ buffer: CMSampleBuffer, through end: CMTime,
++                       isFinal: Bool, using submission: Submission) throws -> Bool {
++        precondition(admissionBuffer == nil)
++        admissionBuffer = buffer
++        defer { admissionBuffer = nil }
++        var calls = 0
++        let accepted = try submission(end, isFinal) {
++            calls += 1
++            // Never enqueue twice, even if a host breaks its contract.
++            if calls == 1 { enqueueAdmittedBuffer() }
++        }
++        guard calls == (accepted ? 1 : 0) else {
++            throw SpatialAudioError.invalidState("Invalid submission admission result")
++        }
++        return accepted
++    }
++
++    private func enqueueAdmittedBuffer() {
++        // The synchronous attempt owns this slot until admit returns.
++        audioRenderer.enqueue(admissionBuffer!)
 +    }
 +
 +    private func waitUntilReady(generation current: Int) async throws {
@@ -121,7 +139,7 @@ diff --git a/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift b/Sources/Spa
          }
      }
  
-@@ -259,7 +299,7 @@
+@@ -259,7 +317,7 @@
  
      private func enqueueAgain(from time: CMTime, flushed: Bool, generation current: Int) {
          // A newer timeline has reset the refill, and may have started its own.
@@ -130,7 +148,7 @@ diff --git a/Sources/SpatialAudioBridge/SpatialAudioRenderer.swift b/Sources/Spa
          refilling = false
          // Too close to the playhead to flush part of the queue: start over from what has yet to play.
          guard flushed else { return requeue() }
-@@ -270,6 +310,7 @@
+@@ -270,6 +328,7 @@
      /// The flush resets the decoder, so it starts at the sync packet before the playhead; the packets
      /// before the playhead only prime the decoder.
      private func requeue() {
