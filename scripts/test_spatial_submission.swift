@@ -32,7 +32,7 @@ final class AVSampleBufferAudioRenderer: @unchecked Sendable {
         for callback in callbacks { callback(true) }
     }
 }
-final class AVSampleBufferRenderSynchronizer: @unchecked Sendable {
+public final class AVSampleBufferRenderSynchronizer: @unchecked Sendable {
     let timebase: CMTimebase
     var delaysRateChangeUntilHasSufficientMediaData = false
     init() {
@@ -49,11 +49,12 @@ final class AVSampleBufferRenderSynchronizer: @unchecked Sendable {
     func addRenderer(_ renderer: AVSampleBufferAudioRenderer) {}
     func removeRenderer(_ renderer: AVSampleBufferAudioRenderer, at time: CMTime) {}
 }
-enum SpatialAudioCodec { case trueHD }
+public enum SpatialAudioCodec { case trueHD }
 enum SpatialAudioError: Error {
     case invalidConfiguration(String), invalidState(String), encoding(String), coreMedia(OSStatus)
 }
-struct APACConfiguration {
+public struct APACConfiguration {
+    public init() {}
     struct Layout { var channelCount: Int { 2 } }
     var layout = Layout()
     var liveEncoding = true
