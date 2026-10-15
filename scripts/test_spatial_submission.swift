@@ -100,7 +100,7 @@ struct APACEncoder {
 
 enum ProbeError: Error { case terminal, timeout }
 @main struct SubmissionChecks {
-    static func wait(_ predicate: () -> Bool) async throws {
+    static func wait(_ predicate: @Sendable () -> Bool) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
         while !predicate() {
             guard ContinuousClock.now < deadline else { throw ProbeError.timeout }
