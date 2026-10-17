@@ -76,10 +76,10 @@ index 0000000..e9d11c0
 +char *mp_spatial_failure(void *output);
 diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
 new file mode 100644
-index 0000000..7ce098b
+index 0000000..431af17
 --- /dev/null
 +++ b/audio/out/ao_spatial.m
-@@ -0,0 +1,366 @@
+@@ -0,0 +1,368 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -200,13 +200,14 @@ index 0000000..7ce098b
 +    }
 +}
 +
++// Reconciles the synchronizer with the wanted state on every call, rather
++// than trusting that an earlier rate change took.
 +static void set_running(struct priv *p, bool running)
 +{
-+    if (p->running == running)
-+        return;
-+    p->synchronizer.rate = running ? 1 : 0;
 +    p->running = running;
 +    p->started |= running;
++    if ((p->synchronizer.rate != 0) != running)
++        [p->synchronizer setRate:running ? 1 : 0 time:kCMTimeInvalid];
 +}
 +
 +// covered: how far the renderer holds audio, or INT64_MIN if unknown yet.
@@ -218,16 +219,17 @@ index 0000000..7ce098b
 +
 +    bool wanted = p->playing && !p->paused && !p->reload_requested;
 +    int64_t lead = covered == INT64_MIN ? 0 : covered - now;
-+    if (p->running) {
++    bool running = p->running;
++    if (running) {
 +        // A held tail plays out to its end.
 +        if (!wanted || (!tail && lead < STOP_LEAD))
-+            set_running(p, false);
++            running = false;
 +    } else if (wanted && lead > 0) {
 +        // The first start waits for the renderer's own readiness. A renderer
 +        // that takes no more holds all it can, so it need not reach the lead.
-+        if (tail || ((ready || p->started) && (lead >= RESUME_LEAD || p->full)))
-+            set_running(p, true);
++        running = tail || ((ready || p->started) && (lead >= RESUME_LEAD || p->full));
 +    }
++    set_running(p, running);
 +}
 +
 +static int init(struct ao *ao)
@@ -309,7 +311,7 @@ index 0000000..7ce098b
 +    // Not set when init() failed.
 +    if (!p->output)
 +        return;
-+    p->synchronizer.rate = 0;
++    [p->synchronizer setRate:0 time:kCMTimeInvalid];
 +    mp_spatial_destroy(p->output);
 +    [p->synchronizer release];
 +    free(p->staged);
