@@ -102,10 +102,18 @@ def compile_bridge(root, source, output, mpv, target, sdk, environment):
     resources = output / "SpatialResources.swift"
     resources.write_text('import Foundation\nlet mpSpatialSilentAtmos = Data(base64Encoded: "' +
                          base64.b64encode(silent.read_bytes()).decode() + '")!\n')
+    # Since 2.0 the source ships a framework module map for its release
+    # framework. The core is linked statically here, so import its header
+    # through a plain module of the same name.
+    include = output / "include/SpatialAudioCore"
+    include.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source / "Rust/SpatialAudioCore/include/SpatialAudioCore/SpatialAudioCore.h", include)
+    (include / "module.modulemap").write_text(
+        'module SpatialAudioCore {\n    header "SpatialAudioCore.h"\n    export *\n}\n')
     run("xcrun", "swiftc", "-swift-version", "6", "-O", "-whole-module-optimization",
         "-parse-as-library", "-emit-library", "-static", "-module-name", "MPVSpatial",
         "-file-prefix-map", f"{root}=/mpv-build", "-file-prefix-map", f"{source}=/spatial-audio-bridge",
-        "-target", target, "-sdk", sdk, "-I", source / "Rust/SpatialAudioCore/include",
+        "-target", target, "-sdk", sdk, "-I", output / "include",
         *sources, resources, "-o", output / "libmpv_spatial.a", env=environment)
 
 
