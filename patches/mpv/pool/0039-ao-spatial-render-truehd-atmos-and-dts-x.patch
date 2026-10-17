@@ -76,10 +76,10 @@ index 0000000..e9d11c0
 +char *mp_spatial_failure(void *output);
 diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
 new file mode 100644
-index 0000000..431af17
+index 0000000..eea43b1
 --- /dev/null
 +++ b/audio/out/ao_spatial.m
-@@ -0,0 +1,368 @@
+@@ -0,0 +1,369 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -200,14 +200,15 @@ index 0000000..431af17
 +    }
 +}
 +
-+// Reconciles the synchronizer with the wanted state on every call, rather
-+// than trusting that an earlier rate change took.
++// The synchronizer applies rate changes asynchronously, so every change goes
++// through setRate:time:, in order, and the driver tracks what it asked for.
 +static void set_running(struct priv *p, bool running)
 +{
++    if (p->running == running)
++        return;
++    [p->synchronizer setRate:running ? 1 : 0 time:kCMTimeInvalid];
 +    p->running = running;
 +    p->started |= running;
-+    if ((p->synchronizer.rate != 0) != running)
-+        [p->synchronizer setRate:running ? 1 : 0 time:kCMTimeInvalid];
 +}
 +
 +// covered: how far the renderer holds audio, or INT64_MIN if unknown yet.
