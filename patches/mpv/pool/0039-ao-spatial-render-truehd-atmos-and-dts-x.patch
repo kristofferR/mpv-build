@@ -42,10 +42,10 @@ index 4e5e9e3..0fd3c87 100644
  #define MUL_GAIN_i(d, num_samples, gain, low, center, high)                     \
 diff --git a/audio/out/ao_spatial.h b/audio/out/ao_spatial.h
 new file mode 100644
-index 0000000..6a5d4ab
+index 0000000..e9d11c0
 --- /dev/null
 +++ b/audio/out/ao_spatial.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,28 @@
 +// Private interface between ao_spatial and its Swift sink. Not installed.
 +#pragma once
 +#include <stdbool.h>
@@ -66,18 +66,20 @@ index 0000000..6a5d4ab
 +size_t mp_spatial_write(void *output, const void *bytes, size_t size);
 +void mp_spatial_end(void *output);
 +void mp_spatial_volume(void *output, float volume);
-+// Returns MP_SPATIAL_*. *covered is how far the renderer holds audio, in
-+// nanoseconds on the synchronizer clock, or INT64_MIN before the timeline
-+// has reset it. *final: the end of the stream has been enqueued.
-+int mp_spatial_poll(void *output, bool *ready, int64_t *covered, bool *final);
++// Returns MP_SPATIAL_*. Times are nanoseconds on the synchronizer clock, or
++// INT64_MIN before the timeline has reset the renderer: *covered is how far
++// the renderer holds audio, *end how far the enqueued audio reaches.
++// *final: the end of the stream has been enqueued.
++int mp_spatial_poll(void *output, bool *ready, int64_t *covered, int64_t *end,
++                    bool *final);
 +// Describes the current failure for the log, or returns NULL. free() it.
 +char *mp_spatial_failure(void *output);
 diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
 new file mode 100644
-index 0000000..1d98cbe
+index 0000000..7ce098b
 --- /dev/null
 +++ b/audio/out/ao_spatial.m
-@@ -0,0 +1,363 @@
+@@ -0,0 +1,366 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -208,7 +210,8 @@ index 0000000..1d98cbe
 +}
 +
 +// covered: how far the renderer holds audio, or INT64_MIN if unknown yet.
-+static void update_clock(struct ao *ao, bool ready, int64_t covered, bool final,
++// tail: it holds everything up to the end of the stream.
++static void update_clock(struct ao *ao, bool ready, int64_t covered, bool tail,
 +                         int64_t now)
 +{
 +    struct priv *p = ao->priv;
@@ -216,13 +219,13 @@ index 0000000..1d98cbe
 +    bool wanted = p->playing && !p->paused && !p->reload_requested;
 +    int64_t lead = covered == INT64_MIN ? 0 : covered - now;
 +    if (p->running) {
-+        // A finished stream plays out to its end.
-+        if (!wanted || (!final && lead < STOP_LEAD))
++        // A held tail plays out to its end.
++        if (!wanted || (!tail && lead < STOP_LEAD))
 +            set_running(p, false);
 +    } else if (wanted && lead > 0) {
 +        // The first start waits for the renderer's own readiness. A renderer
 +        // that takes no more holds all it can, so it need not reach the lead.
-+        if (final || ((ready || p->started) && (lead >= RESUME_LEAD || p->full)))
++        if (tail || ((ready || p->started) && (lead >= RESUME_LEAD || p->full)))
 +            set_running(p, true);
 +    }
 +}
@@ -387,15 +390,15 @@ index 0000000..1d98cbe
 +
 +    offer_staged(ao);
 +    bool ready = false, final = false;
-+    int64_t covered = INT64_MIN;
-+    int failure = mp_spatial_poll(p->output, &ready, &covered, &final);
++    int64_t covered = INT64_MIN, end_time = INT64_MIN;
++    int failure = mp_spatial_poll(p->output, &ready, &covered, &end_time, &final);
 +    if (failure == MP_SPATIAL_DISCONTINUITY) {
 +        // The queued audio is lost; what mpv writes next starts a new timeline.
 +        MP_VERBOSE(ao, "gap in the passthrough stream, beginning a new timeline\n");
 +        begin_timeline(ao);
 +        offer_staged(ao);
 +        ready = final = false;
-+        covered = INT64_MIN;
++        covered = end_time = INT64_MIN;
 +    } else if (failure == MP_SPATIAL_FAILED && !p->reload_requested) {
 +        char *reason = mp_spatial_failure(p->output);
 +        MP_WARN(ao, "the renderer failed (%s), falling back to PCM\n",
@@ -407,10 +410,12 @@ index 0000000..1d98cbe
 +    }
 +
 +    int64_t now = ns_from_time([p->synchronizer currentTime]);
-+    update_clock(ao, ready, covered, final, now);
++    // A route change can flush part of a finished stream; the tail plays
++    // out only once the renderer holds all of it again.
++    update_clock(ao, ready, covered, final && covered >= end_time, now);
 +    now = ns_from_time([p->synchronizer currentTime]);
 +
-+    bool drained = p->ended && final && covered <= now;
++    bool drained = p->ended && final && end_time <= now;
 +    // Split so that days of 192 kHz audio stay within int64.
 +    int64_t written = p->written / ao->samplerate * INT64_C(1000000000) +
 +                      p->written % ao->samplerate * INT64_C(1000000000) / ao->samplerate;
@@ -443,10 +448,10 @@ index 0000000..1d98cbe
 +};
 diff --git a/audio/out/ao_spatial.swift b/audio/out/ao_spatial.swift
 new file mode 100644
-index 0000000..718d72b
+index 0000000..a7fd3f1
 --- /dev/null
 +++ b/audio/out/ao_spatial.swift
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,204 @@
 +@preconcurrency import AVFoundation // Xcode 26 SDKs omit the synchronizer's Sendable annotation.
 +import Synchronization
 +
@@ -460,6 +465,8 @@ index 0000000..718d72b
 +        // The end of the audio the renderer held at the last poll of its
 +        // asynchronous queuedAhead, for the current timeline.
 +        var queuedEnd: CMTime?
++        // That poll began after the end of the stream was enqueued.
++        var queuedAfterFinal = false
 +        var closed = false
 +        var poller: Task<Void, Never>?
 +        var activator: AtmosOutputActivator?
@@ -516,16 +523,22 @@ index 0000000..718d72b
 +
 +    private func pollQueue() async {
 +        let generation = state.withLock { $0.generation }
++        let final = sink.progress?.isFinal == true
 +        // Read first, so the result never overstates the queue.
 +        let now = synchronizer.currentTime()
 +        let ahead = await sink.queuedAhead
-+        state.withLock { if $0.generation == generation { $0.queuedEnd = now + ahead } }
++        state.withLock { state in
++            guard state.generation == generation else { return }
++            state.queuedEnd = now + ahead
++            state.queuedAfterFinal = final
++        }
 +    }
 +
 +    func begin(at time: CMTime) {
 +        state.withLock { state in
 +            state.generation += 1
 +            state.queuedEnd = nil
++            state.queuedAfterFinal = false
 +            sink.begin(at: time)
 +        }
 +    }
@@ -536,22 +549,23 @@ index 0000000..718d72b
 +
 +    var failure: (any Error)? { sink.failure }
 +
-+    func poll(ready: inout Bool, covered: inout Int64, final: inout Bool) -> Int32 {
-+        let queuedEnd = state.withLock { $0.queuedEnd }
++    func poll(ready: inout Bool, covered: inout Int64, end: inout Int64, final: inout Bool) -> Int32 {
++        let (queuedEnd, queuedAfterFinal) = state.withLock { ($0.queuedEnd, $0.queuedAfterFinal) }
 +        let failure = sink.failure
 +        ready = sink.isReady
 +        guard let progress = sink.progress else {
 +            covered = .min
++            end = .min
 +            final = false
 +            return Self.kind(of: failure)
 +        }
-+        final = progress.isFinal
 +        // Progress counts what was enqueued; the queue also misses audio
 +        // a route change flushed until the renderer has enqueued it again.
-+        // The polled queue lags new audio, which only makes it cautious, but
-+        // ends early by the final padding, so a finished stream uses progress.
-+        let end = final ? progress.submittedEnd : min(progress.submittedEnd, queuedEnd ?? progress.timelineStart)
-+        covered = Self.nanoseconds(end)
++        // The polled queue lags new audio, which only makes it cautious, so
++        // the end counts only once the queue has been measured after it.
++        final = progress.isFinal && queuedAfterFinal
++        covered = Self.nanoseconds(min(progress.submittedEnd, queuedEnd ?? progress.timelineStart))
++        end = Self.nanoseconds(progress.submittedEnd)
 +        return Self.kind(of: failure)
 +    }
 +
@@ -627,10 +641,11 @@ index 0000000..718d72b
 +
 +@_cdecl("mp_spatial_poll")
 +func mpSpatialPoll(_ pointer: UnsafeMutableRawPointer, _ ready: UnsafeMutablePointer<Bool>,
-+                   _ covered: UnsafeMutablePointer<Int64>, _ final: UnsafeMutablePointer<Bool>) -> Int32 {
++                   _ covered: UnsafeMutablePointer<Int64>, _ end: UnsafeMutablePointer<Int64>,
++                   _ final: UnsafeMutablePointer<Bool>) -> Int32 {
 +    if #available(macOS 26, iOS 26, tvOS 26, *) {
 +        return Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue()
-+            .poll(ready: &ready.pointee, covered: &covered.pointee, final: &final.pointee)
++            .poll(ready: &ready.pointee, covered: &covered.pointee, end: &end.pointee, final: &final.pointee)
 +    }
 +    return 2
 +}

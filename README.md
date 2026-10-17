@@ -489,7 +489,7 @@ change flushed until it is enqueued again. The clock starts once the sink is
 ready, stops with 250 ms of that audio left, and resumes with 500 ms queued, or
 when the renderer takes no more. A slow conversion therefore holds playback
 instead of letting the renderer drop late audio; a finished stream plays out to
-its end. mpv's ao thread checks the output every 125 ms while it streams. These
+its end once the renderer holds all of it, and drains when the clock passes it. mpv's ao thread checks the output every 125 ms while it streams. These
 are scheduling policies, not timing or queue-capacity guarantees.
 
 What the sink cannot take yet, about half a second, waits in the output and

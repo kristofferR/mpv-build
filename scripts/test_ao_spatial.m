@@ -36,6 +36,8 @@ struct fake_sink {
     bool ready, final;
     int failure;
     int64_t covered;
+    // Enqueued audio a route change flushed from the renderer.
+    int64_t missing;
 };
 
 static struct fake_sink *opening_sink;
@@ -57,6 +59,7 @@ void mp_spatial_begin(void *ctx, int64_t time)
     s->ready = s->final = false;
     s->failure = MP_SPATIAL_OK;
     s->covered = INT64_MIN;
+    s->missing = 0;
     [s->received setLength:0];
 }
 // Like the real sink, a failed timeline takes nothing until the next begin.
@@ -76,11 +79,12 @@ void mp_spatial_volume(void *ctx, float volume)
     s->volumes++;
     s->volume = volume;
 }
-int mp_spatial_poll(void *ctx, bool *ready, int64_t *covered, bool *final)
+int mp_spatial_poll(void *ctx, bool *ready, int64_t *covered, int64_t *end, bool *final)
 {
     struct fake_sink *s = ctx;
     *ready = s->ready;
     *covered = s->covered;
+    *end = s->covered == INT64_MIN ? INT64_MIN : s->covered + s->missing;
     *final = s->final;
     return s->failure;
 }
@@ -334,9 +338,15 @@ int main(void)
         CHECK(st.playing && st.free_samples == 0, "the next file waits for this one to play out");
         state_of(ao);
         CHECK(s->ends == 1, "the end is sent once");
-        // A finished stream plays out to its end, below the stop lead too.
+        // A route change flushed part of the finished stream: its tail waits
+        // until the renderer holds it again, and the stream is not drained.
         s->ready = s->final = true;
         s->covered = now_of(ao) + 100 * MS;
+        s->missing = 300 * MS;
+        st = state_of(ao);
+        CHECK(rate_of(ao) == 0 && st.playing, "a flushed tail waits for the renderer");
+        // A finished stream plays out to its end, below the stop lead too.
+        s->missing = 0;
         st = state_of(ao);
         CHECK(rate_of(ao) == 1 && st.playing, "the final tail plays");
         usleep(130 * 1000);
@@ -376,7 +386,8 @@ int main(void)
         state_of(ao);
         state_of(ao);
         CHECK(reloads == 1 && s->failure_reads == 1, "a failure is logged and requests one reload (%d)", reloads);
-        CHECK(rate_of(ao) == 0, "and stops the clock");
+        CHECK(rate_of(ao) == 0, "and stops the clock (rate %f, running %d, playing %d, reload %d)",
+              rate_of(ao), p->running, p->playing, p->reload_requested);
 
         uninit(ao);
         CHECK(s->closes == 2, "uninit closes the sink (%d)", s->closes);

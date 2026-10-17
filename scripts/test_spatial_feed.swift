@@ -135,10 +135,10 @@ struct BridgeChecks {
         bytes.withUnsafeBytes { mpSpatialWrite(output, $0.baseAddress!, $0.count) }
     }
 
-    static func poll(_ output: UnsafeMutableRawPointer) -> (kind: Int32, ready: Bool, covered: Int64, final: Bool) {
-        var ready = false, covered: Int64 = 0, final = false
-        let kind = mpSpatialPoll(output, &ready, &covered, &final)
-        return (kind, ready, covered, final)
+    static func poll(_ output: UnsafeMutableRawPointer) -> (kind: Int32, ready: Bool, covered: Int64, end: Int64, final: Bool) {
+        var ready = false, covered: Int64 = 0, end: Int64 = 0, final = false
+        let kind = mpSpatialPoll(output, &ready, &covered, &end, &final)
+        return (kind, ready, covered, end, final)
     }
 
     static func failure(_ output: UnsafeMutableRawPointer) -> String? {
@@ -187,6 +187,7 @@ struct BridgeChecks {
         // The polled queue caps the coverage below what was enqueued.
         SpatialAudioRenderer.queueLimit.withLock { $0 = CMTime(value: 100, timescale: 1000) }
         try await wait("a shorter queue lowers the coverage") { poll(output).covered == 100 * ms }
+        check(poll(output).end == 500 * ms, "the end is still what was enqueued")
         SpatialAudioRenderer.queueLimit.withLock { $0 = nil }
         try await wait("a refilled queue restores it") { poll(output).covered == 500 * ms }
 
@@ -196,11 +197,14 @@ struct BridgeChecks {
         check(poll(output).kind == 0 && SpatialAudioRenderer.log.withLock { $0.packets.count } == 5,
               "silence neither enqueues audio nor fails")
 
-        // The end reports the final coverage from progress, ignoring the queue.
-        SpatialAudioRenderer.queueLimit.withLock { $0 = CMTime(value: 100, timescale: 1000) }
+        // The end counts once the queue has been measured after it, and a
+        // later flush still lowers the coverage of the finished stream.
         mpSpatialEnd(output)
         try await wait("the end is final") { poll(output).final }
-        check(poll(output).covered == 500 * ms, "a final stream is covered to its enqueued end")
+        check(poll(output).covered == 500 * ms && poll(output).end == 500 * ms, "a final stream is covered to its end")
+        SpatialAudioRenderer.queueLimit.withLock { $0 = CMTime(value: 100, timescale: 1000) }
+        try await wait("a flush lowers a final stream's coverage") { poll(output).covered == 100 * ms }
+        check(poll(output).final && poll(output).end == 500 * ms, "but not its end")
         SpatialAudioRenderer.queueLimit.withLock { $0 = nil }
 
         // A new timeline forgets the previous one's queue.

@@ -23,7 +23,7 @@ int main(int argc, char **argv)
         for (int seek = 0; seek < 3; seek++) {
             mp_spatial_begin(sink, seek * INT64_C(1000000000));
             bool ready = false, final = false;
-            int64_t covered = INT64_MIN;
+            int64_t covered = INT64_MIN, end = INT64_MIN;
             int failure = MP_SPATIAL_OK;
             // Split across IEC headers and payloads, as mpv may do, and offer
             // again what the bounded buffer did not take yet.
@@ -32,7 +32,7 @@ int main(int argc, char **argv)
                 size_t size = MIN(8191, bursts.length - offset);
                 size_t taken = mp_spatial_write(sink, (const char *)bursts.bytes + offset, size);
                 offset += taken;
-                failure = mp_spatial_poll(sink, &ready, &covered, &final);
+                failure = mp_spatial_poll(sink, &ready, &covered, &end, &final);
                 if (!taken) {
                     if (deadline.timeIntervalSinceNow < 0) {
                         fprintf(stderr, "the sink stopped taking input\n");
@@ -46,7 +46,7 @@ int main(int argc, char **argv)
             deadline = [NSDate dateWithTimeIntervalSinceNow:10];
             while (!final && failure == MP_SPATIAL_OK && deadline.timeIntervalSinceNow > 0) {
                 pump(0.01);
-                failure = mp_spatial_poll(sink, &ready, &covered, &final);
+                failure = mp_spatial_poll(sink, &ready, &covered, &end, &final);
             }
             if ((failure != MP_SPATIAL_OK) != expect_failure || (!expect_failure && (!ready || !final))) {
                 char *reason = mp_spatial_failure(sink);
@@ -56,7 +56,7 @@ int main(int argc, char **argv)
                 return 4;
             }
             if (expect_failure) break;
-            printf("timeline %d: covered to %.3f s\n", seek, covered / 1e9);
+            printf("timeline %d: enqueued to %.3f s\n", seek, end / 1e9);
         }
         mp_spatial_destroy(sink);
         pump(0.2);
