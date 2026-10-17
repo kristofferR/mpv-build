@@ -3,19 +3,20 @@ import Synchronization
 
 // Only the renderer and the activator are replaced. The production bridge and
 // SpatialAudioBridge's pinned passthrough sink and IEC unpacker are compiled
-// alongside this file.
-enum SpatialAudioCodec: UInt32, Sendable { case trueHDAtmos = 1, dtsX = 2 }
-struct APACConfiguration: Sendable {}
+// alongside this file. The sink's public API names these types, so they are
+// public too.
+public enum SpatialAudioCodec: UInt32, Sendable { case trueHDAtmos = 1, dtsX = 2 }
+public struct APACConfiguration: Sendable { public init() {} }
 enum SpatialAudioError: Error, Sendable {
     case decoding(String), unsupported(String), discontinuity(String), encoding(String)
 }
 enum HarnessError: Error { case timeout(String) }
 let mpSpatialSilentAtmos = Data()
 
-struct SpatialAudioRendererProgress: Sendable, Equatable {
-    let timelineStart: CMTime
-    let submittedEnd: CMTime
-    let isFinal: Bool
+public struct SpatialAudioRendererProgress: Sendable, Equatable {
+    public let timelineStart: CMTime
+    public let submittedEnd: CMTime
+    public let isFinal: Bool
 }
 
 // Each enqueued packet plays for 100 ms.
