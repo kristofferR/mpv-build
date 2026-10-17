@@ -1,7 +1,7 @@
 name: Publish binaries
 
-# Every push to main publishes the binaries that commit needs, so any commit on
-# main is pinnable. Asset names are content-addressed (they carry a key derived
+# This fork validation branch publishes Apple's binaries only on dispatch.
+# Asset names are content-addressed (they carry a key derived
 # from the sources that produced them), which makes them immutable: an asset
 # that already exists on a rolling prerelease is byte-identical to the one this
 # run would upload, so it is skipped instead of clobbered.
@@ -22,12 +22,26 @@ name: Publish binaries
 # Only main publishes: a dispatch on any other branch builds, records and
 # verifies everything stale, then uploads no asset and pushes no manifest.
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
+    inputs:
+      bridge_only:
+        description: Compile only the private Swift bridge with Xcode 26.6
+        type: boolean
+        default: false
+      publish:
+        description: Publish validated binaries and commit their manifest (requires coordinator approval)
+        type: boolean
+        default: false
+      inspect_run:
+        description: Inspect and consumer-link an existing run's binaries without rebuilding libraries or publishing
+        type: string
+        default: ''
 
-# Two pushes must never interleave asset uploads or commits to main, and a
+# This validation branch only publishes Apple's artifacts to Kris's fork.
+env:
+  GH_REPO: kristofferR/mpv-build
+
+# Two runs must never interleave asset uploads or commits to their branch, and a
 # cancelled run could leave the manifest committed without its assets.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -37,11 +51,89 @@ permissions:
   contents: read
 
 jobs:
+  workflow-check:
+    name: Validate fork workflow
+    if: github.repository == 'kristofferR/mpv-build' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Lint the dispatch workflow
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/publish.yml
+
+  inspect-archives:
+    name: Inspect packages and link consumers
+    needs: workflow-check
+    if: inputs.inspect_run != '' && !inputs.publish
+    permissions:
+      contents: read
+      actions: read
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select and report Xcode 26.6
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+          xcrun swiftc -version
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.inspect_run }}
+          pattern: apple-*
+          path: ./dist/inspection
+      - name: Verify packaged core exports and deployment targets
+        run: |
+          command -v uv || brew install uv
+          uv run --no-project python scripts/inspect_spatial_packages.py dist/inspection
+
+      - name: Merge and verify the existing platform binaries
+        run: |
+          uv run --no-project python scripts/merge_xcframeworks.py dist/inspection dist/release
+          bash scripts/test_build_date.sh dist/release/*.zip
+          uv run --no-project python scripts/keys.py record-frameworks --platform-group apple --release-dir dist/release
+          uv run --no-project python scripts/keys.py render --platform-group apple
+          uv run --no-project python scripts/keys.py verify --platform-group apple
+
+      - name: Link Objective-C-only SwiftPM consumers on iOS and tvOS
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/xcodegen.zip" \
+            https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip
+          echo "4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806  $RUNNER_TEMP/xcodegen.zip" \
+            | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
+          PATH="$RUNNER_TEMP/xcodegen/bin:$PATH" bash scripts/test_spatial_swiftpm.sh dist/release
+
+  bridge-check:
+    name: Check spatial bridge on Xcode 26.6
+    needs: workflow-check
+    if: inputs.inspect_run == ''
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select and report Xcode 26.6
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+          xcrun swiftc -version
+      - name: Compile the pinned renderer and private bridge
+        shell: bash
+        run: |
+          command -v uv || brew install uv
+          uv run --no-project python scripts/patches.py fetch-pinned mpv apple "$RUNNER_TEMP/mpv-source"
+          uv run --no-project python scripts/build_spatial.py --bridge-only \
+            --source "$RUNNER_TEMP/spatial-source" --output "$RUNNER_TEMP/spatial-check" \
+            --mpv "$RUNNER_TEMP/mpv-source" --target arm64-apple-tvos14.0 \
+            --sdk "$(xcrun --sdk appletvos --show-sdk-path)"
+          ls -lh "$RUNNER_TEMP/spatial-check/libmpv_spatial.a"
+
   tests:
     name: Patch regression tests
-    # The marker sits on this workflow's own commit, so the run it triggers
-    # stops here instead of looping.
-    if: ${{ !contains(github.event.head_commit.message, '[skip binaries]') }}
+    needs: bridge-check
+    if: github.repository == 'kristofferR/mpv-build' && github.event_name == 'workflow_dispatch' && !inputs.bridge_only
     permissions:
       contents: read
     # The harnesses need only bash, python3 and cc (plus libass's host
@@ -53,6 +145,12 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select and report Xcode 26.6
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+          xcrun swiftc -version
 
       - name: Test AO PCM lookahead
         run: ./scripts/test_ao_pcm_lookahead.sh
@@ -210,9 +308,8 @@ jobs:
         # crash in keys.py is not swallowed by the pipe into paste.
         shell: bash
         run: |
-          # The group list and the per-group platform variants are discovered,
-          # not restated here: keys.py reads them out of platforms/*/group.json.
-          groups="$(python3 scripts/keys.py groups)"
+          # Only Apple binaries are authorized for this fork validation.
+          groups="apple"
           echo "groups=${groups}" >> "$GITHUB_STEP_SUMMARY"
 
           stale_groups=""
@@ -276,10 +373,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Select and report Xcode 26.6
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+          xcrun swiftc -version
+
       - name: Install dependencies
         run: |
-          brew install autoconf automake libtool ninja
-          python -m pip install meson==1.4.2
+          brew install autoconf automake libtool ninja pkgconf wget uv
+          uv tool install meson==1.4.2
+          # The Swift driver uses its own PATH, without ~/.local/bin.
+          ln -sf "$HOME/.local/bin/meson" "$(brew --prefix)/bin/meson"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # Only the stale libraries are compiled; the rest are restored from their
       # published per-platform zips. No version= argument: the URLs the build
@@ -331,7 +437,7 @@ jobs:
           if-no-files-found: error
 
   publish-apple:
-    name: Publish apple
+    name: Package apple
     needs: build-apple
     permissions:
       contents: write
@@ -339,11 +445,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Select and report Xcode 26.6
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+          xcrun swiftc -version
+
       - name: Download platform builds
         uses: actions/download-artifact@v4
         with:
           pattern: apple-*
           path: ./dist/partials
+
+      - name: Inspect all packaged core symbols and deployment targets
+        run: python3 scripts/inspect_spatial_packages.py dist/partials
 
       - name: Merge platform XCFrameworks
         run: python3 scripts/merge_xcframeworks.py dist/partials dist/release
@@ -374,7 +489,7 @@ jobs:
         run: bash scripts/test_spatial_swiftpm.sh dist/release
 
       - name: Upload binaries that are not published yet
-        if: github.ref == 'refs/heads/main'
+        if: inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/keys.py publish-assets --platform-group apple
@@ -573,7 +688,7 @@ jobs:
     # skipped need would otherwise skip this job -- silently publishing nothing
     # and leaving the commit unpinnable. The per-row gate below decides which
     # rows actually act; `!cancelled()` keeps a superseded run from publishing.
-    if: always() && !cancelled() && needs.plan.outputs.stale_groups != ''
+    if: always() && !cancelled() && inputs.publish && needs.plan.outputs.stale_groups != ''
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -595,12 +710,15 @@ jobs:
       # every stale group got here.
       - name: Skip groups with nothing stale
         id: stale
+        env:
+          STALE_GROUPS: ${{ needs.plan.outputs.stale_groups }}
+          PLATFORM_GROUP: ${{ matrix.group }}
         run: |
-          if [[ "${{ needs.plan.outputs.stale_groups }}" == *",${{ matrix.group }},"* ]]; then
+          if [[ "$STALE_GROUPS" == *",$PLATFORM_GROUP,"* ]]; then
             echo "stale=true" >> "$GITHUB_OUTPUT"
           else
             echo "stale=false" >> "$GITHUB_OUTPUT"
-            echo "${{ matrix.group }}: nothing stale, keeping the committed section"
+            echo "$PLATFORM_GROUP: nothing stale, keeping the committed section"
           fi
 
       # actions/download-artifact has no fail-on-empty input: a pattern that
@@ -656,7 +774,7 @@ jobs:
         run: python3 scripts/keys.py verify --platform-group ${{ matrix.group }}
 
       - name: Upload binaries that are not published yet
-        if: steps.stale.outputs.stale == 'true' && github.ref == 'refs/heads/main'
+        if: inputs.publish && steps.stale.outputs.stale == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/keys.py publish-assets --platform-group ${{ matrix.group }}
@@ -680,7 +798,7 @@ jobs:
     needs: [plan, publish-apple, publish]
     # always(): this gate is what proves a group that was stale actually
     # published, so it must run even when one of them failed.
-    if: always() && !cancelled() && needs.plan.outputs.stale_groups != ''
+    if: always() && !cancelled() && inputs.publish && needs.plan.outputs.stale_groups != ''
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -759,7 +877,7 @@ jobs:
       # queued run for the newer commit publishes the right manifest instead.
       # The assets uploaded above are content-addressed, so that run reuses them.
       - name: Push binary manifest
-        if: steps.changes.outputs.changed == 'true' && github.ref == 'refs/heads/main'
+        if: steps.changes.outputs.changed == 'true'
         uses: EndBug/add-and-commit@v9
         with:
           default_author: github_actions
