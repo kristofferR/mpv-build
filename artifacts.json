@@ -32,7 +32,7 @@
       }
     },
     "apple": {
-      "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-apple",
+      "assetBase": "https://github.com/kristofferR/mpv-build/releases/download/binaries-apple",
       "libraries": {
         "FFmpeg": {
           "frameworks": {
